@@ -525,3 +525,68 @@ JSON 的问题：
 - 服务器第一版使用 `UdpClient + JSON`，不要引入复杂网络库。
 - 消息处理第一版使用清晰的 `switch` 或 `if` 分支，不使用反射分发。
 - Codex 只编写脚本和服务器代码，不直接修改 Unity 场景或 Prefab；Unity 端组件挂载和引用拖拽由用户手动完成。
+## 阶段 1 完成记录：最小 UDP 服务器
+
+完成时间：2026-07-12
+
+状态：已完成，并已由用户在本地验证通过。
+
+本阶段完成内容：
+
+- `Server/Server/Program.cs` 已从模板程序改为最小 UDP 服务器。
+- 服务器使用 .NET 自带 `UdpClient`，监听端口 `7777`。
+- Unity 客户端新增 `Assets/Code/UdpNetworkClient.cs`。
+- Unity 客户端启动后可以发送 `ClientHello`。
+- 服务器收到 `ClientHello` 后，为客户端分配 `playerId`。
+- 服务器回复 `ServerWelcome`。
+- 服务端控制台会打印连接日志和收到的 JSON 消息。
+- Unity Console 会打印发送消息、收到消息和分配到的 `playerId`。
+
+阶段 1 消息示例：
+
+```json
+{
+  "type": "ClientHello",
+  "name": "Player"
+}
+```
+
+```json
+{
+  "type": "ServerWelcome",
+  "playerId": 1,
+  "message": "Welcome to the UDP demo server."
+}
+```
+
+阶段 1 验收结果：
+
+- 服务器能启动。
+- Unity 客户端能连接服务器。
+- 服务器能给客户端分配玩家 id。
+- 所有阶段 1 消息都能在控制台看懂。
+
+阶段 1 保持的约束：
+
+- 第一版使用 `UdpClient + JSON`。
+- 消息处理使用清晰的 `switch` 分支。
+- 没有引入复杂网络库。
+- 没有直接修改 Unity 场景或 Prefab。
+- Unity 端 `UdpNetworkClient` 需要用户在编辑器中手动挂载。
+
+## 下一次具体任务（阶段 2）
+
+建议下一次新任务直接开始阶段 2：
+
+> 请帮我完成阶段 2：Tick 输入与服务器权威移动。让 Unity 客户端按固定网络 tick 发送输入包，服务器以 30 Hz tick 接管玩家位置计算，并广播 `WorldSnapshot`，客户端根据快照更新玩家位置。
+
+阶段 2 开发约束：
+
+- 继续遵守“先理解，再升级”的原则。
+- 继续使用 `UdpClient + JSON`。
+- 继续使用清晰的 `switch` 或 `if` 分支处理消息，不使用反射分发。
+- 服务器先只实现最小权威移动，不做预测、回滚、插值。
+- 客户端第一版只需要能把输入发给服务器，并能按服务器快照更新位置。
+- 阶段 2 暂时不做远端玩家插值，那是阶段 3。
+- 阶段 2 暂时不做本地预测，那是阶段 4。
+- Codex 只编写脚本和服务器代码，不直接修改 Unity 场景或 Prefab；Unity 端组件挂载和引用拖拽由用户手动完成。

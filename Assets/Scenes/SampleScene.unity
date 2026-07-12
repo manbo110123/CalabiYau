@@ -1134,7 +1134,11 @@ GameObject:
   - component: {fileID: 1784959815}
   - component: {fileID: 1784959812}
   - component: {fileID: 1784959816}
-  - component: {fileID: 1784959813}
+  - component: {fileID: 1784959821}
+  - component: {fileID: 1784959820}
+  - component: {fileID: 1784959819}
+  - component: {fileID: 1784959818}
+  - component: {fileID: 1784959817}
   m_Layer: 0
   m_Name: Tank
   m_TagString: Untagged
@@ -1158,30 +1162,6 @@ Rigidbody:
   m_Interpolate: 0
   m_Constraints: 0
   m_CollisionDetection: 1
---- !u!114 &1784959813
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1784959811}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 01090fc5fbe0cc145914278ba7a176e6, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  gunPoint: {fileID: 1257374753}
-  bulletSpeed: 30
-  bulletPrefab: {fileID: 8750068786670321226, guid: 6c09b442b1bc6f44488e7b4d1c979a83,
-    type: 3}
-  moveSpeed: 5
-  rotateSpeed: 2
-  tankTower: {fileID: 65497299}
-  towerRotationSpeed: 1
-  aimTransform: {fileID: 322044413}
-  whatIsAimMask:
-    serializedVersion: 2
-    m_Bits: 1
 --- !u!4 &1784959815
 Transform:
   m_ObjectHideFlags: 0
@@ -1212,6 +1192,132 @@ BoxCollider:
   serializedVersion: 2
   m_Size: {x: 2.7930517, y: 2.48, z: 4.367799}
   m_Center: {x: -0.9950583, y: 0.75, z: 0.9796877}
+--- !u!114 &1784959817
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1784959811}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 90fa24345ff24e8a87b87e487548a3f4, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  gunPoint: {fileID: 1257374753}
+  bulletSpeed: 30
+  bulletPrefab: {fileID: 8750068786670321226, guid: 6c09b442b1bc6f44488e7b4d1c979a83,
+    type: 3}
+  moveSpeed: 5
+  rotateSpeed: 3
+  tankTower: {fileID: 65497299}
+  towerRotationSpeed: 2
+  aimTransform: {fileID: 322044413}
+  whatIsAimMask:
+    serializedVersion: 2
+    m_Bits: 1
+  tankInput: {fileID: 0}
+  tankMotor: {fileID: 0}
+  tankAim: {fileID: 0}
+  tankWeapon: {fileID: 0}
+--- !u!114 &1784959818
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1784959811}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2793ebfe0102423487a26e6010e9ded5, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!114 &1784959819
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1784959811}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0f641756c40c4323876e12e029ac997c, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!114 &1784959820
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1784959811}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 32587ef993e5431d848ee96fa0a54eac, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!114 &1784959821
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1784959811}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 805008274c0a459faaff8136502ccec3, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  invertTurnWhenReversing: 1
+--- !u!1 &1907406079
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1907406081}
+  - component: {fileID: 1907406080}
+  m_Layer: 0
+  m_Name: NetworkClient
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1907406080
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1907406079}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7c0e71e8f75f4475b963f26bfb809c7b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  serverAddress: 127.0.0.1
+  serverPort: 7777
+  playerName: Player
+  sendHelloOnStart: 1
+  logJsonMessages: 1
+--- !u!4 &1907406081
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1907406079}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -8.732355, y: -5.054656, z: 9.027733}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_RootOrder: 10
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1915791720
 GameObject:
   m_ObjectHideFlags: 0
