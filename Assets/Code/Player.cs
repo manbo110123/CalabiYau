@@ -25,7 +25,7 @@ public class Player : MonoBehaviour
     [SerializeField] private Transform aimTransform;
     [SerializeField] private LayerMask whatIsAimMask;
 
-    //
+    
     private void Start()
     {
         rb = GetComponent<Rigidbody>();
