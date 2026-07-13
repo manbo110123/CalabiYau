@@ -7,6 +7,10 @@ using UnityEngine;
 [RequireComponent(typeof(TankWeapon))]
 public class TankController : MonoBehaviour
 {
+    [Header("Control mode")]
+    [SerializeField] private bool applyLocalMovement = true;
+    [SerializeField] private bool applyLocalWeapon = true;
+
     [Header("Gun data")]
     [SerializeField] private Transform gunPoint;
     [SerializeField] private float bulletSpeed;
@@ -32,6 +36,7 @@ public class TankController : MonoBehaviour
 
     private TankInputData currentInput;
     public TankInputData CurrentInput => currentInput;
+    public Vector3 CurrentAimPoint => tankAim != null ? tankAim.CurrentAimPoint : transform.position + transform.forward;
 
     private void Awake()
     {
@@ -51,14 +56,38 @@ public class TankController : MonoBehaviour
     {
         currentInput = tankInput.ReadInput();
         tankAim.UpdateAimPoint(currentInput.MouseScreenPosition);
-        tankWeapon.TryFire(currentInput);
+
+        if (applyLocalWeapon)
+        {
+            tankWeapon.TryFire(currentInput);
+        }
     }
 
     private void FixedUpdate()
     {
-        tankMotor.ApplyMovement(currentInput);
-        tankMotor.ApplyBodyRotation(currentInput);
+        if (applyLocalMovement)
+        {
+            tankMotor.ApplyMovement(currentInput);
+            tankMotor.ApplyBodyRotation(currentInput);
+        }
+
         tankAim.ApplyTowerRotation();
+    }
+
+    public void SetLocalMovementEnabled(bool isEnabled)
+    {
+        applyLocalMovement = isEnabled;
+    }
+
+    public void SetLocalWeaponEnabled(bool isEnabled)
+    {
+        applyLocalWeapon = isEnabled;
+    }
+
+    public void SetLocalControlEnabled(bool isEnabled)
+    {
+        applyLocalMovement = isEnabled;
+        applyLocalWeapon = isEnabled;
     }
 
     private T GetTankPart<T>(T currentPart) where T : Component
