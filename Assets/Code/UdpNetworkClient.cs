@@ -17,7 +17,10 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private TankController localTank;
     [SerializeField] private NetworkTankAvatar localAvatar;
     [SerializeField] private bool serverAuthoritativeMovement = true;
+    [SerializeField] private bool enableClientPrediction = true;
+    [SerializeField] private bool snapToFirstLocalServerSnapshot = true;
     [SerializeField] private bool disableLocalWeaponInNetworkMode = true;
+    [SerializeField] private bool disableLocalCollisionInNetworkMode = true;
 
     [Header("Remote Players")]
     [SerializeField] private GameObject remoteTankPrefab;
@@ -25,23 +28,64 @@ public class UdpNetworkClient : MonoBehaviour
 
     [Header("Network Tick")]
     [SerializeField] private float inputTickRate = 30f;
+    [SerializeField] private int localInputHistorySize = 64;
+
+    [Header("Local Reconciliation")]
+    [SerializeField] private bool enablePredictionReconciliation = true;
+    [SerializeField] private float reconciliationMoveSpeed = 7f;
+    [SerializeField] private float reconciliationTurnDegreesPerSecond = 180f;
+    [SerializeField] private float predictionCorrectionDeadZone = 0.15f;
+    [SerializeField] private float hardCorrectionBaseDistance = 1.25f;
+    [SerializeField] private float rttCorrectionThresholdScale = 0.5f;
+    [SerializeField] private float smoothCorrectionSpeed = 5f;
+    [SerializeField] private bool smoothCorrectionWhileInputActive = false;
+    [SerializeField] private float activeInputDeadZone = 0.05f;
+
+    [Header("Remote Interpolation")]
+    [SerializeField] private bool interpolateRemotePlayers = true;
+    [SerializeField] private float remoteInterpolationDelaySeconds = 0.1f;
+    [SerializeField] private int remoteInterpolationBufferSize = 8;
 
     [Header("Debug")]
     [SerializeField] private bool logJsonMessages = true;
     [SerializeField] private bool logSnapshots = false;
+    [SerializeField] private bool logLocalPrediction = false;
 
     private UdpClient udpClient;
     private int playerId;
     private int inputTick;
     private float inputTimer;
+    private bool hasAppliedInitialLocalServerSnapshot;
+    private bool hasAuthoritativeLocalSnapshot;
+    private int lastAuthoritativeServerTick;
+    private int lastProcessedLocalInputTick;
+    private Vector3 lastAuthoritativeLocalPosition;
+    private Quaternion lastAuthoritativeLocalRotation;
+    private float lastAuthoritativeLocalAimX;
+    private float lastAuthoritativeLocalAimZ;
+    private int predictionCorrectionCount;
+    private float lastPredictionCorrectionDistance;
 
     private readonly Dictionary<int, NetworkTankAvatar> remoteAvatars = new Dictionary<int, NetworkTankAvatar>();
     private readonly HashSet<int> warnedMissingRemotePrefab = new HashSet<int>();
+    private readonly List<BufferedLocalInput> localInputHistory = new List<BufferedLocalInput>();
 
     public int PlayerId => playerId;
+    public int LastAuthoritativeServerTick => lastAuthoritativeServerTick;
+    public int LastProcessedLocalInputTick => lastProcessedLocalInputTick;
+    public bool HasAuthoritativeLocalSnapshot => hasAuthoritativeLocalSnapshot;
+    public Vector3 LastAuthoritativeLocalPosition => lastAuthoritativeLocalPosition;
+    public Quaternion LastAuthoritativeLocalRotation => lastAuthoritativeLocalRotation;
+    public float LastAuthoritativeLocalAimX => lastAuthoritativeLocalAimX;
+    public float LastAuthoritativeLocalAimZ => lastAuthoritativeLocalAimZ;
+    public int PendingLocalInputCount => localInputHistory.Count;
+    public int PredictionCorrectionCount => predictionCorrectionCount;
+    public float LastPredictionCorrectionDistance => lastPredictionCorrectionDistance;
 
     private void Start()
     {
+        Application.runInBackground = true;
+
         ResolveLocalReferences();
         ApplyOfflineControlMode();
         OpenSocket();
@@ -82,7 +126,7 @@ public class UdpNetworkClient : MonoBehaviour
             localTank = GetComponent<TankController>();
         }
 
-        if (localAvatar == null && localTank != null)
+        if (localTank != null && (localAvatar == null || !IsAvatarOnLocalTank(localAvatar)))
         {
             localAvatar = localTank.GetComponent<NetworkTankAvatar>();
         }
@@ -90,6 +134,12 @@ public class UdpNetworkClient : MonoBehaviour
         if (localAvatar == null && localTank != null)
         {
             localAvatar = localTank.gameObject.AddComponent<NetworkTankAvatar>();
+        }
+
+        if (remoteTankParent != null && !remoteTankParent.gameObject.scene.IsValid())
+        {
+            Debug.LogWarning("remoteTankParent points to a Prefab asset. Remote tanks will be spawned at the scene root instead.");
+            remoteTankParent = null;
         }
 
         if (remoteTankParent == null)
@@ -103,6 +153,11 @@ public class UdpNetworkClient : MonoBehaviour
         }
     }
 
+    private bool IsAvatarOnLocalTank(NetworkTankAvatar avatar)
+    {
+        return localTank != null && avatar != null && avatar.gameObject == localTank.gameObject;
+    }
+
     private void ApplyNetworkControlMode()
     {
         if (localTank == null || !serverAuthoritativeMovement)
@@ -110,17 +165,34 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
-        localTank.SetLocalMovementEnabled(false);
-
-        if (localAvatar != null)
+        if (enableClientPrediction)
         {
-            localAvatar.SetNetworkAuthorityMode(true);
+            localTank.SetLocalMovementEnabled(true);
+            localTank.SetNetworkPredictionMovementSpeeds(
+                reconciliationMoveSpeed,
+                reconciliationTurnDegreesPerSecond);
+
+            if (localAvatar != null)
+            {
+                localAvatar.SetNetworkAuthorityMode(false);
+            }
+        }
+        else
+        {
+            localTank.SetLocalMovementEnabled(false);
+
+            if (localAvatar != null)
+            {
+                localAvatar.SetNetworkAuthorityMode(true);
+            }
         }
 
         if (disableLocalWeaponInNetworkMode)
         {
             localTank.SetLocalWeaponEnabled(false);
         }
+
+        localTank.SetLocalMovementIgnoresPhysicsCollision(enableClientPrediction && disableLocalCollisionInNetworkMode);
     }
 
     private void ApplyOfflineControlMode()
@@ -128,6 +200,7 @@ public class UdpNetworkClient : MonoBehaviour
         if (localTank != null)
         {
             localTank.SetLocalControlEnabled(true);
+            localTank.SetLocalMovementIgnoresPhysicsCollision(false);
         }
 
         if (localAvatar != null)
@@ -170,7 +243,29 @@ public class UdpNetworkClient : MonoBehaviour
         message.aimZ = aimPoint.z;
         message.fire = inputData.FirePressed;
 
+        SaveLocalInput(message);
         SendJson(JsonUtility.ToJson(message));
+    }
+
+    private void SaveLocalInput(PlayerInputMessage message)
+    {
+        BufferedLocalInput bufferedInput = new BufferedLocalInput
+        {
+            InputTick = message.inputTick,
+            MoveAxis = message.moveAxis,
+            TurnAxis = message.turnAxis,
+            AimX = message.aimX,
+            AimZ = message.aimZ,
+            Fire = message.fire,
+            SentTime = Time.time
+        };
+
+        localInputHistory.Add(bufferedInput);
+
+        while (localInputHistory.Count > Mathf.Max(1, localInputHistorySize))
+        {
+            localInputHistory.RemoveAt(0);
+        }
     }
 
     private void OpenSocket()
@@ -261,6 +356,7 @@ public class UdpNetworkClient : MonoBehaviour
     {
         ServerWelcomeMessage welcome = JsonUtility.FromJson<ServerWelcomeMessage>(json);
         playerId = welcome.playerId;
+        ResetLocalPredictionState();
         ApplyNetworkControlMode();
         Debug.Log($"Connected to server. playerId={playerId}, message={welcome.message}");
     }
@@ -281,15 +377,15 @@ public class UdpNetworkClient : MonoBehaviour
 
         for (int i = 0; i < snapshot.players.Length; i++)
         {
-            ApplyPlayerSnapshot(snapshot.players[i]);
+            ApplyPlayerSnapshot(snapshot.serverTick, snapshot.players[i]);
         }
     }
 
-    private void ApplyPlayerSnapshot(PlayerSnapshotMessage snapshot)
+    private void ApplyPlayerSnapshot(int serverTick, PlayerSnapshotMessage snapshot)
     {
         if (snapshot.playerId == playerId)
         {
-            ApplyLocalSnapshot(snapshot);
+            ApplyLocalSnapshot(serverTick, snapshot);
             return;
         }
 
@@ -297,6 +393,19 @@ public class UdpNetworkClient : MonoBehaviour
 
         if (remoteAvatar == null)
         {
+            return;
+        }
+
+        if (interpolateRemotePlayers)
+        {
+            remoteAvatar.AddRemoteSnapshot(
+                serverTick,
+                snapshot.x,
+                snapshot.y,
+                snapshot.z,
+                snapshot.bodyYaw,
+                snapshot.aimX,
+                snapshot.aimZ);
             return;
         }
 
@@ -309,7 +418,88 @@ public class UdpNetworkClient : MonoBehaviour
             snapshot.aimZ);
     }
 
-    private void ApplyLocalSnapshot(PlayerSnapshotMessage snapshot)
+    private void ApplyLocalSnapshot(int serverTick, PlayerSnapshotMessage snapshot)
+    {
+        StoreAuthoritativeLocalSnapshot(serverTick, snapshot);
+
+        if (ShouldApplyLocalSnapshotToTransform())
+        {
+            ApplyLocalSnapshotToTransform(snapshot);
+        }
+        else if (ShouldReconcileLocalPrediction())
+        {
+            ReconcileLocalPrediction(snapshot);
+        }
+
+        if (logLocalPrediction)
+        {
+            Debug.Log(
+                $"Local prediction ack: serverTick={lastAuthoritativeServerTick}, " +
+                $"lastProcessedInputTick={lastProcessedLocalInputTick}, " +
+                $"authoritativePosition={lastAuthoritativeLocalPosition}");
+        }
+    }
+
+    private bool ShouldApplyLocalSnapshotToTransform()
+    {
+        if (!serverAuthoritativeMovement || !enableClientPrediction)
+        {
+            return true;
+        }
+
+        if (snapToFirstLocalServerSnapshot && !hasAppliedInitialLocalServerSnapshot)
+        {
+            hasAppliedInitialLocalServerSnapshot = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool ShouldReconcileLocalPrediction()
+    {
+        return serverAuthoritativeMovement
+            && enableClientPrediction
+            && enablePredictionReconciliation
+            && localTank != null;
+    }
+
+    private void StoreAuthoritativeLocalSnapshot(int serverTick, PlayerSnapshotMessage snapshot)
+    {
+        hasAuthoritativeLocalSnapshot = true;
+        lastAuthoritativeServerTick = serverTick;
+        lastProcessedLocalInputTick = snapshot.lastProcessedInputTick;
+        lastAuthoritativeLocalPosition = new Vector3(snapshot.x, snapshot.y, snapshot.z);
+        lastAuthoritativeLocalRotation = Quaternion.Euler(0f, snapshot.bodyYaw, 0f);
+        lastAuthoritativeLocalAimX = snapshot.aimX;
+        lastAuthoritativeLocalAimZ = snapshot.aimZ;
+        RemoveAcknowledgedLocalInputs(lastProcessedLocalInputTick);
+    }
+
+    private void ResetLocalPredictionState()
+    {
+        hasAppliedInitialLocalServerSnapshot = false;
+        hasAuthoritativeLocalSnapshot = false;
+        lastAuthoritativeServerTick = 0;
+        lastProcessedLocalInputTick = 0;
+        lastAuthoritativeLocalPosition = Vector3.zero;
+        lastAuthoritativeLocalRotation = Quaternion.identity;
+        lastAuthoritativeLocalAimX = 0f;
+        lastAuthoritativeLocalAimZ = 0f;
+        predictionCorrectionCount = 0;
+        lastPredictionCorrectionDistance = 0f;
+        localInputHistory.Clear();
+    }
+
+    private void RemoveAcknowledgedLocalInputs(int acknowledgedInputTick)
+    {
+        while (localInputHistory.Count > 0 && localInputHistory[0].InputTick <= acknowledgedInputTick)
+        {
+            localInputHistory.RemoveAt(0);
+        }
+    }
+
+    private void ApplyLocalSnapshotToTransform(PlayerSnapshotMessage snapshot)
     {
         if (localAvatar != null)
         {
@@ -331,6 +521,217 @@ public class UdpNetworkClient : MonoBehaviour
         Transform tankTransform = localTank.transform;
         tankTransform.position = new Vector3(snapshot.x, snapshot.y, snapshot.z);
         tankTransform.rotation = Quaternion.Euler(0f, snapshot.bodyYaw, 0f);
+    }
+
+    private void ReconcileLocalPrediction(PlayerSnapshotMessage snapshot)
+    {
+        ReconciledLocalState reconciledState = BuildReconciledLocalState(snapshot);
+        Vector3 currentPosition = localTank.transform.position;
+        float correctionDistance = Vector3.Distance(currentPosition, reconciledState.Position);
+
+        lastPredictionCorrectionDistance = correctionDistance;
+
+        float adjustedDeadZone = GetAdjustedDeadZone();
+        float adjustedHardCorrectionDistance = GetAdjustedHardCorrectionDistance();
+
+        if (correctionDistance <= adjustedDeadZone)
+        {
+            return;
+        }
+
+        if (correctionDistance >= adjustedHardCorrectionDistance)
+        {
+            predictionCorrectionCount++;
+            ApplyReconciledLocalStateImmediately(reconciledState);
+
+            if (logLocalPrediction)
+            {
+                Debug.Log(
+                    $"Prediction hard correction: distance={correctionDistance:F3}, " +
+                    $"threshold={adjustedHardCorrectionDistance:F3}, " +
+                    $"pendingInputs={localInputHistory.Count}");
+            }
+
+            return;
+        }
+
+        if (!smoothCorrectionWhileInputActive && IsLocalMovementInputActive())
+        {
+            if (logLocalPrediction)
+            {
+                Debug.Log(
+                    $"Prediction smooth correction delayed while input is active: " +
+                    $"distance={correctionDistance:F3}, " +
+                    $"hardThreshold={adjustedHardCorrectionDistance:F3}, " +
+                    $"pendingInputs={localInputHistory.Count}");
+            }
+
+            return;
+        }
+
+        predictionCorrectionCount++;
+        SmoothToReconciledLocalState(reconciledState, adjustedDeadZone);
+
+        if (logLocalPrediction)
+        {
+            Debug.Log(
+                $"Prediction smooth correction: distance={correctionDistance:F3}, " +
+                $"hardThreshold={adjustedHardCorrectionDistance:F3}, " +
+                $"pendingInputs={localInputHistory.Count}");
+        }
+    }
+
+    private bool IsLocalMovementInputActive()
+    {
+        if (localTank == null)
+        {
+            return false;
+        }
+
+        TankInputData currentInput = localTank.CurrentInput;
+        return Mathf.Abs(currentInput.MoveAxis) > activeInputDeadZone
+            || Mathf.Abs(currentInput.TurnAxis) > activeInputDeadZone;
+    }
+
+    private ReconciledLocalState BuildReconciledLocalState(PlayerSnapshotMessage snapshot)
+    {
+        Vector3 position = new Vector3(snapshot.x, snapshot.y, snapshot.z);
+        float yaw = snapshot.bodyYaw;
+        float aimX = snapshot.aimX;
+        float aimZ = snapshot.aimZ;
+        float tickDeltaTime = 1f / Mathf.Max(1f, inputTickRate);
+
+        for (int i = 0; i < localInputHistory.Count; i++)
+        {
+            ReplayBufferedInput(localInputHistory[i], tickDeltaTime, ref position, ref yaw, ref aimX, ref aimZ);
+        }
+
+        ReplayCurrentPartialInput(tickDeltaTime, ref position, ref yaw, ref aimX, ref aimZ);
+
+        ReconciledLocalState reconciledState = new ReconciledLocalState
+        {
+            Position = position,
+            Rotation = Quaternion.Euler(0f, yaw, 0f),
+            AimX = aimX,
+            AimZ = aimZ
+        };
+
+        return reconciledState;
+    }
+
+    private void ReplayBufferedInput(
+        BufferedLocalInput input,
+        float deltaTime,
+        ref Vector3 position,
+        ref float yaw,
+        ref float aimX,
+        ref float aimZ)
+    {
+        float moveAxis = Mathf.Clamp(input.MoveAxis, -1f, 1f);
+        float turnAxis = Mathf.Clamp(input.TurnAxis, -1f, 1f);
+
+        yaw += turnAxis * reconciliationTurnDegreesPerSecond * deltaTime;
+
+        float yawRadians = yaw * Mathf.Deg2Rad;
+        Vector3 forward = new Vector3(Mathf.Sin(yawRadians), 0f, Mathf.Cos(yawRadians));
+        position += forward * reconciliationMoveSpeed * moveAxis * deltaTime;
+
+        aimX = input.AimX;
+        aimZ = input.AimZ;
+    }
+
+    private void ReplayCurrentPartialInput(
+        float tickDeltaTime,
+        ref Vector3 position,
+        ref float yaw,
+        ref float aimX,
+        ref float aimZ)
+    {
+        if (localTank == null)
+        {
+            return;
+        }
+
+        float partialDeltaTime = Mathf.Clamp(inputTimer, 0f, tickDeltaTime);
+
+        if (partialDeltaTime <= 0f)
+        {
+            return;
+        }
+
+        TankInputData currentInput = localTank.CurrentInput;
+        Vector3 currentAimPoint = localTank.CurrentAimPoint;
+        BufferedLocalInput partialInput = new BufferedLocalInput
+        {
+            MoveAxis = currentInput.MoveAxis,
+            TurnAxis = currentInput.TurnAxis,
+            AimX = currentAimPoint.x,
+            AimZ = currentAimPoint.z,
+            Fire = currentInput.FirePressed,
+            SentTime = Time.time
+        };
+
+        ReplayBufferedInput(partialInput, partialDeltaTime, ref position, ref yaw, ref aimX, ref aimZ);
+    }
+
+    private float GetAdjustedDeadZone()
+    {
+        float estimatedRttSeconds = EstimateLocalRttSeconds();
+        float rttDistance = estimatedRttSeconds * reconciliationMoveSpeed;
+        return Mathf.Max(0.001f, predictionCorrectionDeadZone + rttDistance * 0.02f);
+    }
+
+    private float GetAdjustedHardCorrectionDistance()
+    {
+        float estimatedRttSeconds = EstimateLocalRttSeconds();
+        float rttDistance = estimatedRttSeconds * reconciliationMoveSpeed;
+        return Mathf.Max(0.01f, hardCorrectionBaseDistance + rttDistance * rttCorrectionThresholdScale);
+    }
+
+    private float EstimateLocalRttSeconds()
+    {
+        int pendingInputTicks = Mathf.Max(0, inputTick - lastProcessedLocalInputTick);
+        return pendingInputTicks / Mathf.Max(1f, inputTickRate);
+    }
+
+    private void ApplyReconciledLocalStateImmediately(ReconciledLocalState reconciledState)
+    {
+        if (localAvatar != null)
+        {
+            localAvatar.ApplyServerStateImmediately(
+                reconciledState.Position,
+                reconciledState.Rotation,
+                reconciledState.AimX,
+                reconciledState.AimZ);
+            return;
+        }
+
+        localTank.transform.position = reconciledState.Position;
+        localTank.transform.rotation = reconciledState.Rotation;
+    }
+
+    private void SmoothToReconciledLocalState(ReconciledLocalState reconciledState, float stopDistance)
+    {
+        if (localAvatar != null)
+        {
+            localAvatar.SmoothToPredictedServerState(
+                reconciledState.Position,
+                reconciledState.Rotation,
+                reconciledState.AimX,
+                reconciledState.AimZ,
+                smoothCorrectionSpeed,
+                stopDistance);
+            return;
+        }
+
+        localTank.transform.position = Vector3.Lerp(
+            localTank.transform.position,
+            reconciledState.Position,
+            Time.deltaTime * smoothCorrectionSpeed);
+        localTank.transform.rotation = Quaternion.Slerp(
+            localTank.transform.rotation,
+            reconciledState.Rotation,
+            Time.deltaTime * smoothCorrectionSpeed);
     }
 
     private NetworkTankAvatar GetOrCreateRemoteAvatar(PlayerSnapshotMessage snapshot)
@@ -365,8 +766,19 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         avatar.SetNetworkAuthorityMode(true);
+        avatar.SetRemoteInterpolation(
+            interpolateRemotePlayers,
+            GetRemoteInterpolationDelayTicks(),
+            Mathf.Max(1f, inputTickRate),
+            remoteInterpolationBufferSize);
         remoteAvatars.Add(snapshot.playerId, avatar);
         return avatar;
+    }
+
+    private int GetRemoteInterpolationDelayTicks()
+    {
+        float safeTickRate = Mathf.Max(1f, inputTickRate);
+        return Mathf.Max(1, Mathf.RoundToInt(remoteInterpolationDelaySeconds * safeTickRate));
     }
 
     private void DisableLocalGameplay(GameObject tankObject)
@@ -451,4 +863,23 @@ public class PlayerSnapshotMessage
     public float aimX;
     public float aimZ;
     public int lastProcessedInputTick;
+}
+
+public struct BufferedLocalInput
+{
+    public int InputTick;
+    public float MoveAxis;
+    public float TurnAxis;
+    public float AimX;
+    public float AimZ;
+    public bool Fire;
+    public float SentTime;
+}
+
+public struct ReconciledLocalState
+{
+    public Vector3 Position;
+    public Quaternion Rotation;
+    public float AimX;
+    public float AimZ;
 }

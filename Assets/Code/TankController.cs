@@ -90,6 +90,25 @@ public class TankController : MonoBehaviour
         applyLocalWeapon = isEnabled;
     }
 
+    public void SetLocalMovementIgnoresPhysicsCollision(bool isEnabled)
+    {
+        if (tankMotor != null)
+        {
+            tankMotor.SetIgnorePhysicsCollision(isEnabled);
+        }
+    }
+
+    public void SetNetworkPredictionMovementSpeeds(float moveMetersPerSecond, float turnDegreesPerSecond)
+    {
+        moveSpeed = moveMetersPerSecond;
+        rotateSpeed = turnDegreesPerSecond * Time.fixedDeltaTime;
+
+        if (tankMotor != null)
+        {
+            tankMotor.SetMovementSpeeds(moveSpeed, rotateSpeed);
+        }
+    }
+
     private T GetTankPart<T>(T currentPart) where T : Component
     {
         if (currentPart != null)

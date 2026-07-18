@@ -360,18 +360,6 @@ Transform:
     type: 3}
   m_PrefabInstance: {fileID: 500172661}
   m_PrefabAsset: {fileID: 0}
---- !u!114 &350124773 stripped
-MonoBehaviour:
-  m_CorrespondingSourceObject: {fileID: 4945342787491529114, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
-    type: 3}
-  m_PrefabInstance: {fileID: 500172661}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 0}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: d5f561d64717488f9122283b61bee8d3, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
 --- !u!114 &350124774 stripped
 MonoBehaviour:
   m_CorrespondingSourceObject: {fileID: 3412212381769644643, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
@@ -970,15 +958,30 @@ MonoBehaviour:
   playerName: Player
   sendHelloOnStart: 1
   localTank: {fileID: 350124774}
-  localAvatar: {fileID: 350124773}
+  localAvatar: {fileID: 0}
   serverAuthoritativeMovement: 1
+  enableClientPrediction: 1
+  snapToFirstLocalServerSnapshot: 1
   disableLocalWeaponInNetworkMode: 1
-  remoteTankPrefab: {fileID: 3412212381769644649, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
+  disableLocalCollisionInNetworkMode: 1
+  remoteTankPrefab: {fileID: 3412212381769644649, guid: 76c259d79a6883a48b7f2aaff89de796,
     type: 3}
   remoteTankParent: {fileID: 0}
   inputTickRate: 30
+  localInputHistorySize: 64
+  enablePredictionReconciliation: 1
+  reconciliationMoveSpeed: 7
+  reconciliationTurnDegreesPerSecond: 180
+  predictionCorrectionDeadZone: 0.15
+  hardCorrectionBaseDistance: 1.25
+  rttCorrectionThresholdScale: 0.5
+  smoothCorrectionSpeed: 5
+  interpolateRemotePlayers: 1
+  remoteInterpolationDelaySeconds: 0.1
+  remoteInterpolationBufferSize: 8
   logJsonMessages: 1
   logSnapshots: 0
+  logLocalPrediction: 0
 --- !u!4 &1907406081
 Transform:
   m_ObjectHideFlags: 0
