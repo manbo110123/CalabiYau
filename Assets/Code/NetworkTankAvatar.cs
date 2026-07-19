@@ -7,8 +7,15 @@ public class NetworkTankAvatar : MonoBehaviour
     [SerializeField] private Transform bodyTransform;
     [SerializeField] private Transform tankTower;
     [SerializeField] private Transform aimTransform;
+    [SerializeField] private TankWeapon tankWeapon;
+
+    [Header("Combat feedback")]
+    [SerializeField] private Color hitFlashColor = Color.red;
+    [SerializeField] private float hitFlashSeconds = 0.15f;
 
     private Rigidbody tankRigidbody;
+    private Renderer[] renderers;
+    private Color[] originalColors;
     private bool useNetworkAuthorityMode;
     private bool hasPendingServerState;
     private Vector3 pendingPosition;
@@ -26,7 +33,15 @@ public class NetworkTankAvatar : MonoBehaviour
     private float localCorrectionTargetAimZ;
     private float localCorrectionSpeed = 10f;
     private float localCorrectionStopDistance = 0.02f;
+    private float hitFlashTimer;
+    private int currentHealth = 100;
+    private int maxHealth = 100;
+    private bool isAlive = true;
     private readonly List<BufferedServerState> remoteSnapshotBuffer = new List<BufferedServerState>();
+
+    public int CurrentHealth => currentHealth;
+    public int MaxHealth => maxHealth;
+    public bool IsAlive => isAlive;
 
     private void Awake()
     {
@@ -35,7 +50,13 @@ public class NetworkTankAvatar : MonoBehaviour
             bodyTransform = transform;
         }
 
+        if (tankWeapon == null)
+        {
+            tankWeapon = GetComponent<TankWeapon>();
+        }
+
         tankRigidbody = GetComponent<Rigidbody>();
+        CacheRenderers();
     }
 
     private void FixedUpdate()
@@ -52,6 +73,8 @@ public class NetworkTankAvatar : MonoBehaviour
 
     private void Update()
     {
+        UpdateHitFlash();
+
         if (!useRemoteInterpolation)
         {
             SmoothLocalPredictionCorrection();
@@ -164,6 +187,32 @@ public class NetworkTankAvatar : MonoBehaviour
         }
     }
 
+    public void PlayNetworkFire(Vector3 origin, Vector3 direction, float range)
+    {
+        if (tankWeapon != null)
+        {
+            tankWeapon.PlayNetworkFire(origin, direction, range);
+            return;
+        }
+
+        Debug.DrawRay(origin, direction.normalized * range, Color.yellow, 0.5f);
+    }
+
+    public void PlayHitFeedback(Vector3 hitPoint, int damage)
+    {
+        hitFlashTimer = Mathf.Max(hitFlashTimer, hitFlashSeconds);
+        SetRendererColor(hitFlashColor);
+        Debug.Log($"{name} hit for {damage} at {hitPoint}");
+    }
+
+    public void ApplyNetworkHealth(int health, int newMaxHealth, bool newIsAlive)
+    {
+        currentHealth = health;
+        maxHealth = Mathf.Max(1, newMaxHealth);
+        isAlive = newIsAlive;
+        Debug.Log($"{name} health={currentHealth}/{maxHealth}, alive={isAlive}");
+    }
+
     private void PlayRemoteSnapshotBuffer()
     {
         if (remoteSnapshotBuffer.Count == 0)
@@ -251,6 +300,60 @@ public class NetworkTankAvatar : MonoBehaviour
 
         ApplyBodyStateDirectly(smoothedPosition, smoothedRotation);
         ApplyAimState(localCorrectionTargetAimX, localCorrectionTargetAimZ);
+    }
+
+    private void CacheRenderers()
+    {
+        renderers = GetComponentsInChildren<Renderer>();
+        originalColors = new Color[renderers.Length];
+
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            originalColors[i] = renderers[i].material.color;
+        }
+    }
+
+    private void UpdateHitFlash()
+    {
+        if (hitFlashTimer <= 0f)
+        {
+            return;
+        }
+
+        hitFlashTimer -= Time.deltaTime;
+
+        if (hitFlashTimer <= 0f)
+        {
+            RestoreRendererColors();
+        }
+    }
+
+    private void SetRendererColor(Color color)
+    {
+        if (renderers == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            renderers[i].material.color = color;
+        }
+    }
+
+    private void RestoreRendererColors()
+    {
+        if (renderers == null || originalColors == null)
+        {
+            return;
+        }
+
+        int count = Mathf.Min(renderers.Length, originalColors.Length);
+
+        for (int i = 0; i < count; i++)
+        {
+            renderers[i].material.color = originalColors[i];
+        }
     }
 
     private void RemoveSnapshotsOlderThan(int serverTick)

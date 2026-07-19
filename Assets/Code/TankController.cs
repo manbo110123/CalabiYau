@@ -37,6 +37,8 @@ public class TankController : MonoBehaviour
     private TankInputData currentInput;
     public TankInputData CurrentInput => currentInput;
     public Vector3 CurrentAimPoint => tankAim != null ? tankAim.CurrentAimPoint : transform.position + transform.forward;
+    public Vector3 CurrentFireOrigin => gunPoint != null ? gunPoint.position : transform.position + Vector3.up * 0.8f;
+    public Vector3 CurrentFireDirection => gunPoint != null ? gunPoint.forward : transform.forward;
 
     private void Awake()
     {

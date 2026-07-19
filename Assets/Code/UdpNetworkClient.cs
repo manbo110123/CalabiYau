@@ -50,6 +50,7 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private bool logJsonMessages = true;
     [SerializeField] private bool logSnapshots = false;
     [SerializeField] private bool logLocalPrediction = false;
+    [SerializeField] private bool logGameplayEvents = true;
 
     private UdpClient udpClient;
     private int playerId;
@@ -65,6 +66,8 @@ public class UdpNetworkClient : MonoBehaviour
     private float lastAuthoritativeLocalAimZ;
     private int predictionCorrectionCount;
     private float lastPredictionCorrectionDistance;
+    private int sentFireRequestCount;
+    private int receivedGameplayEventCount;
 
     private readonly Dictionary<int, NetworkTankAvatar> remoteAvatars = new Dictionary<int, NetworkTankAvatar>();
     private readonly HashSet<int> warnedMissingRemotePrefab = new HashSet<int>();
@@ -100,6 +103,11 @@ public class UdpNetworkClient : MonoBehaviour
     {
         ReceivePendingMessages();
         SendInputAtNetworkTick();
+    }
+
+    private void LateUpdate()
+    {
+        SendFireRequestIfPressed();
     }
 
     private void OnApplicationQuit()
@@ -247,6 +255,41 @@ public class UdpNetworkClient : MonoBehaviour
         SendJson(JsonUtility.ToJson(message));
     }
 
+    private void SendFireRequestIfPressed()
+    {
+        if (playerId == 0 || localTank == null)
+        {
+            return;
+        }
+
+        TankInputData inputData = localTank.CurrentInput;
+
+        if (!inputData.FirePressed)
+        {
+            return;
+        }
+
+        Vector3 aimPoint = localTank.CurrentAimPoint;
+        Vector3 fireOrigin = localTank.CurrentFireOrigin;
+        Vector3 fireDirection = localTank.CurrentFireDirection.normalized;
+
+        FireRequestMessage message = new FireRequestMessage();
+        message.type = "FireRequest";
+        message.playerId = playerId;
+        message.requestTick = inputTick;
+        message.aimX = aimPoint.x;
+        message.aimZ = aimPoint.z;
+        message.originX = fireOrigin.x;
+        message.originY = fireOrigin.y;
+        message.originZ = fireOrigin.z;
+        message.directionX = fireDirection.x;
+        message.directionY = fireDirection.y;
+        message.directionZ = fireDirection.z;
+
+        sentFireRequestCount++;
+        SendJson(JsonUtility.ToJson(message));
+    }
+
     private void SaveLocalInput(PlayerInputMessage message)
     {
         BufferedLocalInput bufferedInput = new BufferedLocalInput
@@ -346,6 +389,18 @@ public class UdpNetworkClient : MonoBehaviour
                 HandleWorldSnapshot(json);
                 break;
 
+            case "FireEvent":
+                HandleFireEvent(json);
+                break;
+
+            case "HitEvent":
+                HandleHitEvent(json);
+                break;
+
+            case "HealthChangedEvent":
+                HandleHealthChangedEvent(json);
+                break;
+
             default:
                 Debug.LogWarning($"UDP message ignored: unsupported type '{header.type}'.");
                 break;
@@ -378,6 +433,78 @@ public class UdpNetworkClient : MonoBehaviour
         for (int i = 0; i < snapshot.players.Length; i++)
         {
             ApplyPlayerSnapshot(snapshot.serverTick, snapshot.players[i]);
+        }
+    }
+
+    private void HandleFireEvent(string json)
+    {
+        FireEventMessage fireEvent = JsonUtility.FromJson<FireEventMessage>(json);
+        receivedGameplayEventCount++;
+
+        NetworkTankAvatar shooterAvatar = GetAvatarByPlayerId(fireEvent.shooterPlayerId);
+
+        if (shooterAvatar == null)
+        {
+            Debug.LogWarning($"FireEvent ignored: no avatar for shooter playerId={fireEvent.shooterPlayerId}.");
+            return;
+        }
+
+        Vector3 origin = new Vector3(fireEvent.originX, fireEvent.originY, fireEvent.originZ);
+        Vector3 direction = new Vector3(fireEvent.directionX, fireEvent.directionY, fireEvent.directionZ);
+        shooterAvatar.PlayNetworkFire(origin, direction, fireEvent.range);
+
+        if (logGameplayEvents)
+        {
+            Debug.Log(
+                $"FireEvent serverTick={fireEvent.serverTick}, shooter={fireEvent.shooterPlayerId}, " +
+                $"sentFireRequests={sentFireRequestCount}, receivedEvents={receivedGameplayEventCount}");
+        }
+    }
+
+    private void HandleHitEvent(string json)
+    {
+        HitEventMessage hitEvent = JsonUtility.FromJson<HitEventMessage>(json);
+        receivedGameplayEventCount++;
+
+        NetworkTankAvatar targetAvatar = GetAvatarByPlayerId(hitEvent.targetPlayerId);
+
+        if (targetAvatar == null)
+        {
+            Debug.LogWarning($"HitEvent ignored: no avatar for target playerId={hitEvent.targetPlayerId}.");
+            return;
+        }
+
+        Vector3 hitPoint = new Vector3(hitEvent.hitX, hitEvent.hitY, hitEvent.hitZ);
+        targetAvatar.PlayHitFeedback(hitPoint, hitEvent.damage);
+
+        if (logGameplayEvents)
+        {
+            Debug.Log(
+                $"HitEvent serverTick={hitEvent.serverTick}, shooter={hitEvent.shooterPlayerId}, " +
+                $"target={hitEvent.targetPlayerId}, damage={hitEvent.damage}");
+        }
+    }
+
+    private void HandleHealthChangedEvent(string json)
+    {
+        HealthChangedEventMessage healthEvent = JsonUtility.FromJson<HealthChangedEventMessage>(json);
+        receivedGameplayEventCount++;
+
+        NetworkTankAvatar avatar = GetAvatarByPlayerId(healthEvent.playerId);
+
+        if (avatar == null)
+        {
+            Debug.LogWarning($"HealthChangedEvent ignored: no avatar for playerId={healthEvent.playerId}.");
+            return;
+        }
+
+        avatar.ApplyNetworkHealth(healthEvent.health, healthEvent.maxHealth, healthEvent.isAlive);
+
+        if (logGameplayEvents)
+        {
+            Debug.Log(
+                $"HealthChangedEvent serverTick={healthEvent.serverTick}, player={healthEvent.playerId}, " +
+                $"health={healthEvent.health}/{healthEvent.maxHealth}, alive={healthEvent.isAlive}");
         }
     }
 
@@ -775,6 +902,21 @@ public class UdpNetworkClient : MonoBehaviour
         return avatar;
     }
 
+    private NetworkTankAvatar GetAvatarByPlayerId(int targetPlayerId)
+    {
+        if (targetPlayerId == playerId)
+        {
+            return localAvatar;
+        }
+
+        if (remoteAvatars.TryGetValue(targetPlayerId, out NetworkTankAvatar remoteAvatar))
+        {
+            return remoteAvatar;
+        }
+
+        return null;
+    }
+
     private int GetRemoteInterpolationDelayTicks()
     {
         float safeTickRate = Mathf.Max(1f, inputTickRate);
@@ -845,6 +987,22 @@ public class PlayerInputMessage
 }
 
 [Serializable]
+public class FireRequestMessage
+{
+    public string type;
+    public int playerId;
+    public int requestTick;
+    public float aimX;
+    public float aimZ;
+    public float originX;
+    public float originY;
+    public float originZ;
+    public float directionX;
+    public float directionY;
+    public float directionZ;
+}
+
+[Serializable]
 public class WorldSnapshotMessage
 {
     public string type;
@@ -863,6 +1021,46 @@ public class PlayerSnapshotMessage
     public float aimX;
     public float aimZ;
     public int lastProcessedInputTick;
+}
+
+[Serializable]
+public class FireEventMessage
+{
+    public string type;
+    public int serverTick;
+    public int shooterPlayerId;
+    public int requestTick;
+    public float originX;
+    public float originY;
+    public float originZ;
+    public float directionX;
+    public float directionY;
+    public float directionZ;
+    public float range;
+}
+
+[Serializable]
+public class HitEventMessage
+{
+    public string type;
+    public int serverTick;
+    public int shooterPlayerId;
+    public int targetPlayerId;
+    public float hitX;
+    public float hitY;
+    public float hitZ;
+    public int damage;
+}
+
+[Serializable]
+public class HealthChangedEventMessage
+{
+    public string type;
+    public int serverTick;
+    public int playerId;
+    public int health;
+    public int maxHealth;
+    public bool isAlive;
 }
 
 public struct BufferedLocalInput
