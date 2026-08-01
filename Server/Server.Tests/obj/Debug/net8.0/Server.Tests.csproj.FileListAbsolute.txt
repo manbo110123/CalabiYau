@@ -1,0 +1,15 @@
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\bin\Debug\net8.0\Server.Tests.exe
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\bin\Debug\net8.0\Server.Tests.deps.json
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\bin\Debug\net8.0\Server.Tests.runtimeconfig.json
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\bin\Debug\net8.0\Server.Tests.dll
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\bin\Debug\net8.0\Server.Tests.pdb
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.GeneratedMSBuildEditorConfig.editorconfig
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.AssemblyInfoInputs.cache
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.AssemblyInfo.cs
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.csproj.CoreCompileInputs.cache
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.sourcelink.json
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.dll
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\refint\Server.Tests.dll
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.pdb
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\Server.Tests.genruntimeconfig.cache
+D:\unity project\CalabiYau\CalabiYau\Server\Server.Tests\obj\Debug\net8.0\ref\Server.Tests.dll

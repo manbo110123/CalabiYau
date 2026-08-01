@@ -38,7 +38,8 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private float hardCorrectionBaseDistance = 1.25f;
     [SerializeField] private float rttCorrectionThresholdScale = 0.5f;
     [SerializeField] private float smoothCorrectionSpeed = 5f;
-    [SerializeField] private bool smoothCorrectionWhileInputActive = false;
+    [SerializeField] private float smoothCorrectionMaxSeconds = 0.5f;
+    [SerializeField] private bool smoothCorrectionWhileInputActive = true;
     [SerializeField] private float activeInputDeadZone = 0.05f;
 
     [Header("Remote Interpolation")]
@@ -47,10 +48,14 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private int remoteInterpolationBufferSize = 8;
 
     [Header("Debug")]
-    [SerializeField] private bool logJsonMessages = true;
+    [SerializeField] private bool logJsonMessages = false;
     [SerializeField] private bool logSnapshots = false;
     [SerializeField] private bool logLocalPrediction = false;
     [SerializeField] private bool logGameplayEvents = true;
+    [SerializeField] private bool showNetworkDebugPanel = true;
+    [SerializeField] private KeyCode debugPanelToggleKey = KeyCode.F3;
+    [SerializeField] private Vector2 debugPanelPosition = new Vector2(12f, 12f);
+    [SerializeField] private float debugPanelWidth = 360f;
 
     private UdpClient udpClient;
     private int playerId;
@@ -65,13 +70,35 @@ public class UdpNetworkClient : MonoBehaviour
     private float lastAuthoritativeLocalAimX;
     private float lastAuthoritativeLocalAimZ;
     private int predictionCorrectionCount;
+    private int smoothPredictionCorrectionCount;
+    private int hardPredictionCorrectionCount;
     private float lastPredictionCorrectionDistance;
     private int sentFireRequestCount;
     private int receivedGameplayEventCount;
+    private bool isLocalAlive = true;
+    private int lastReceivedSnapshotTick;
+    private int lastAppliedWorldSnapshotTick;
+    private float lastSnapshotReceivedTime;
+    private int receivedSnapshotCount;
+    private int estimatedMissedSnapshotCount;
+    private int discardedStaleSnapshotCount;
+    private int collapsedSnapshotCount;
+    private bool hasMeasuredRtt;
+    private float smoothedRttSeconds;
+    private float lastRttSampleSeconds;
+    private bool lastFireUsedLagCompensation;
+    private int lastLagCompensationHitTestServerTick;
+    private float lastLagCompensationRewindSeconds;
+    private GUIStyle debugPanelBoxStyle;
+    private GUIStyle debugTitleStyle;
+    private GUIStyle debugRowNameStyle;
+    private GUIStyle debugRowValueStyle;
+    private Vector2 debugPanelScrollPosition;
 
     private readonly Dictionary<int, NetworkTankAvatar> remoteAvatars = new Dictionary<int, NetworkTankAvatar>();
     private readonly HashSet<int> warnedMissingRemotePrefab = new HashSet<int>();
     private readonly List<BufferedLocalInput> localInputHistory = new List<BufferedLocalInput>();
+    private readonly Queue<float> recentPredictionCorrectionTimes = new Queue<float>();
 
     public int PlayerId => playerId;
     public int LastAuthoritativeServerTick => lastAuthoritativeServerTick;
@@ -84,6 +111,11 @@ public class UdpNetworkClient : MonoBehaviour
     public int PendingLocalInputCount => localInputHistory.Count;
     public int PredictionCorrectionCount => predictionCorrectionCount;
     public float LastPredictionCorrectionDistance => lastPredictionCorrectionDistance;
+    public int LocalInputTick => inputTick;
+    public int LastReceivedSnapshotTick => lastReceivedSnapshotTick;
+    public int ReceivedSnapshotCount => receivedSnapshotCount;
+    public int EstimatedMissedSnapshotCount => estimatedMissedSnapshotCount;
+    public float EstimatedSnapshotLossRate => GetEstimatedSnapshotLossRate();
 
     private void Start()
     {
@@ -101,6 +133,7 @@ public class UdpNetworkClient : MonoBehaviour
 
     private void Update()
     {
+        ToggleDebugPanelIfRequested();
         ReceivePendingMessages();
         SendInputAtNetworkTick();
     }
@@ -113,6 +146,11 @@ public class UdpNetworkClient : MonoBehaviour
     private void OnApplicationQuit()
     {
         CloseSocket();
+    }
+
+    private void OnGUI()
+    {
+        DrawNetworkDebugPanel();
     }
 
     [ContextMenu("Send ClientHello")]
@@ -201,6 +239,7 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         localTank.SetLocalMovementIgnoresPhysicsCollision(enableClientPrediction && disableLocalCollisionInNetworkMode);
+        localTank.SetLocalMovementEnabled(isLocalAlive && (enableClientPrediction || !serverAuthoritativeMovement));
     }
 
     private void ApplyOfflineControlMode()
@@ -220,6 +259,11 @@ public class UdpNetworkClient : MonoBehaviour
     private void SendInputAtNetworkTick()
     {
         if (playerId == 0 || localTank == null)
+        {
+            return;
+        }
+
+        if (!isLocalAlive)
         {
             return;
         }
@@ -262,6 +306,11 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
+        if (!isLocalAlive)
+        {
+            return;
+        }
+
         TankInputData inputData = localTank.CurrentInput;
 
         if (!inputData.FirePressed)
@@ -285,6 +334,8 @@ public class UdpNetworkClient : MonoBehaviour
         message.directionX = fireDirection.x;
         message.directionY = fireDirection.y;
         message.directionZ = fireDirection.z;
+        message.estimatedRttSeconds = GetDisplayedRttSeconds();
+        message.interpolationDelaySeconds = remoteInterpolationDelaySeconds;
 
         sentFireRequestCount++;
         SendJson(JsonUtility.ToJson(message));
@@ -355,6 +406,9 @@ public class UdpNetworkClient : MonoBehaviour
 
         try
         {
+            WorldSnapshotMessage newestSnapshot = null;
+            int newestSnapshotTick = 0;
+
             while (udpClient.Available > 0)
             {
                 IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
@@ -366,7 +420,51 @@ public class UdpNetworkClient : MonoBehaviour
                     Debug.Log($"UDP received: {json}");
                 }
 
+                MessageHeader header = JsonUtility.FromJson<MessageHeader>(json);
+
+                // A WorldSnapshot represents the whole world at one server tick. If several
+                // arrived during a frame hitch, only the newest one is useful for prediction.
+                if (header.type == "WorldSnapshot")
+                {
+                    WorldSnapshotMessage snapshot = JsonUtility.FromJson<WorldSnapshotMessage>(json);
+
+                    if (snapshot.players == null)
+                    {
+                        continue;
+                    }
+
+                    RecordSnapshotStats(snapshot.serverTick);
+
+                    if (snapshot.serverTick <= lastAppliedWorldSnapshotTick)
+                    {
+                        discardedStaleSnapshotCount++;
+                        continue;
+                    }
+
+                    if (newestSnapshot == null || snapshot.serverTick > newestSnapshotTick)
+                    {
+                        if (newestSnapshot != null)
+                        {
+                            collapsedSnapshotCount++;
+                        }
+
+                        newestSnapshot = snapshot;
+                        newestSnapshotTick = snapshot.serverTick;
+                    }
+                    else
+                    {
+                        collapsedSnapshotCount++;
+                    }
+
+                    continue;
+                }
+
                 HandleMessage(json);
+            }
+
+            if (newestSnapshot != null)
+            {
+                ApplyWorldSnapshot(newestSnapshot);
             }
         }
         catch (Exception exception)
@@ -411,7 +509,15 @@ public class UdpNetworkClient : MonoBehaviour
     {
         ServerWelcomeMessage welcome = JsonUtility.FromJson<ServerWelcomeMessage>(json);
         playerId = welcome.playerId;
+        isLocalAlive = true;
         ResetLocalPredictionState();
+        ResetNetworkDebugStats();
+
+        if (localAvatar != null)
+        {
+            localAvatar.SetPlayerInfo(playerId, true);
+        }
+
         ApplyNetworkControlMode();
         Debug.Log($"Connected to server. playerId={playerId}, message={welcome.message}");
     }
@@ -424,6 +530,20 @@ public class UdpNetworkClient : MonoBehaviour
         {
             return;
         }
+
+        RecordSnapshotStats(snapshot.serverTick);
+        ApplyWorldSnapshot(snapshot);
+    }
+
+    private void ApplyWorldSnapshot(WorldSnapshotMessage snapshot)
+    {
+        if (snapshot.serverTick <= lastAppliedWorldSnapshotTick)
+        {
+            discardedStaleSnapshotCount++;
+            return;
+        }
+
+        lastAppliedWorldSnapshotTick = snapshot.serverTick;
 
         if (logSnapshots)
         {
@@ -452,11 +572,15 @@ public class UdpNetworkClient : MonoBehaviour
         Vector3 origin = new Vector3(fireEvent.originX, fireEvent.originY, fireEvent.originZ);
         Vector3 direction = new Vector3(fireEvent.directionX, fireEvent.directionY, fireEvent.directionZ);
         shooterAvatar.PlayNetworkFire(origin, direction, fireEvent.range);
+        lastFireUsedLagCompensation = fireEvent.lagCompensated;
+        lastLagCompensationHitTestServerTick = fireEvent.hitTestServerTick;
+        lastLagCompensationRewindSeconds = fireEvent.rewindSeconds;
 
         if (logGameplayEvents)
         {
             Debug.Log(
                 $"FireEvent serverTick={fireEvent.serverTick}, shooter={fireEvent.shooterPlayerId}, " +
+                $"lagCompensated={fireEvent.lagCompensated}, rewind={fireEvent.rewindSeconds * 1000f:F0}ms, " +
                 $"sentFireRequests={sentFireRequestCount}, receivedEvents={receivedGameplayEventCount}");
         }
     }
@@ -499,12 +623,19 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         avatar.ApplyNetworkHealth(healthEvent.health, healthEvent.maxHealth, healthEvent.isAlive);
+        avatar.SetRespawnRemainingSeconds(healthEvent.respawnRemainingSeconds);
+
+        if (healthEvent.playerId == playerId)
+        {
+            SetLocalAliveFromServer(healthEvent.isAlive, null, healthEvent.serverTick);
+        }
 
         if (logGameplayEvents)
         {
             Debug.Log(
                 $"HealthChangedEvent serverTick={healthEvent.serverTick}, player={healthEvent.playerId}, " +
-                $"health={healthEvent.health}/{healthEvent.maxHealth}, alive={healthEvent.isAlive}");
+                $"health={healthEvent.health}/{healthEvent.maxHealth}, alive={healthEvent.isAlive}, " +
+                $"respawnIn={healthEvent.respawnRemainingSeconds:F1}s");
         }
     }
 
@@ -522,6 +653,8 @@ public class UdpNetworkClient : MonoBehaviour
         {
             return;
         }
+
+        ApplySnapshotHealth(remoteAvatar, snapshot);
 
         if (interpolateRemotePlayers)
         {
@@ -547,6 +680,21 @@ public class UdpNetworkClient : MonoBehaviour
 
     private void ApplyLocalSnapshot(int serverTick, PlayerSnapshotMessage snapshot)
     {
+        ApplySnapshotHealth(localAvatar, snapshot);
+
+        if (!snapshot.isAlive)
+        {
+            SetLocalAliveFromServer(false, snapshot, serverTick);
+            StoreAuthoritativeLocalSnapshot(serverTick, snapshot);
+            ApplyLocalSnapshotToTransform(snapshot);
+            return;
+        }
+        else if (!isLocalAlive)
+        {
+            SetLocalAliveFromServer(true, snapshot, serverTick);
+            return;
+        }
+
         StoreAuthoritativeLocalSnapshot(serverTick, snapshot);
 
         if (ShouldApplyLocalSnapshotToTransform())
@@ -564,6 +712,62 @@ public class UdpNetworkClient : MonoBehaviour
                 $"Local prediction ack: serverTick={lastAuthoritativeServerTick}, " +
                 $"lastProcessedInputTick={lastProcessedLocalInputTick}, " +
                 $"authoritativePosition={lastAuthoritativeLocalPosition}");
+        }
+    }
+
+    private void ApplySnapshotHealth(NetworkTankAvatar avatar, PlayerSnapshotMessage snapshot)
+    {
+        if (avatar == null)
+        {
+            return;
+        }
+
+        int safeMaxHealth = snapshot.maxHealth > 0 ? snapshot.maxHealth : 100;
+        int safeHealth = Mathf.Clamp(snapshot.health, 0, safeMaxHealth);
+        avatar.ApplyNetworkHealth(safeHealth, safeMaxHealth, snapshot.isAlive);
+        avatar.SetRespawnRemainingSeconds(snapshot.respawnRemainingSeconds);
+    }
+
+    private void SetLocalAliveFromServer(bool serverSaysAlive, PlayerSnapshotMessage snapshot, int serverTick)
+    {
+        if (isLocalAlive == serverSaysAlive)
+        {
+            return;
+        }
+
+        isLocalAlive = serverSaysAlive;
+        localInputHistory.Clear();
+        inputTimer = 0f;
+
+        if (!isLocalAlive)
+        {
+            if (localTank != null)
+            {
+                localTank.SetLocalMovementEnabled(false);
+                localTank.SetLocalWeaponEnabled(false);
+            }
+
+            if (logGameplayEvents)
+            {
+                Debug.Log("Local player died. Local prediction movement and FireRequest sending are paused until respawn.");
+            }
+
+            return;
+        }
+
+        ResetLocalPredictionState();
+
+        if (snapshot != null)
+        {
+            ApplyLocalSnapshotToTransform(snapshot);
+            StoreAuthoritativeLocalSnapshot(serverTick, snapshot);
+        }
+
+        ApplyNetworkControlMode();
+
+        if (logGameplayEvents)
+        {
+            Debug.Log("Local player respawned. Local prediction movement is enabled again.");
         }
     }
 
@@ -600,6 +804,7 @@ public class UdpNetworkClient : MonoBehaviour
         lastAuthoritativeLocalRotation = Quaternion.Euler(0f, snapshot.bodyYaw, 0f);
         lastAuthoritativeLocalAimX = snapshot.aimX;
         lastAuthoritativeLocalAimZ = snapshot.aimZ;
+        UpdateRttFromAcknowledgedInput(lastProcessedLocalInputTick);
         RemoveAcknowledgedLocalInputs(lastProcessedLocalInputTick);
     }
 
@@ -614,8 +819,73 @@ public class UdpNetworkClient : MonoBehaviour
         lastAuthoritativeLocalAimX = 0f;
         lastAuthoritativeLocalAimZ = 0f;
         predictionCorrectionCount = 0;
+        smoothPredictionCorrectionCount = 0;
+        hardPredictionCorrectionCount = 0;
         lastPredictionCorrectionDistance = 0f;
+        recentPredictionCorrectionTimes.Clear();
         localInputHistory.Clear();
+    }
+
+    private void ResetNetworkDebugStats()
+    {
+        lastReceivedSnapshotTick = 0;
+        lastAppliedWorldSnapshotTick = 0;
+        lastSnapshotReceivedTime = 0f;
+        receivedSnapshotCount = 0;
+        estimatedMissedSnapshotCount = 0;
+        discardedStaleSnapshotCount = 0;
+        collapsedSnapshotCount = 0;
+        hasMeasuredRtt = false;
+        smoothedRttSeconds = 0f;
+        lastRttSampleSeconds = 0f;
+        lastFireUsedLagCompensation = false;
+        lastLagCompensationHitTestServerTick = 0;
+        lastLagCompensationRewindSeconds = 0f;
+        sentFireRequestCount = 0;
+        receivedGameplayEventCount = 0;
+    }
+
+    private void RecordSnapshotStats(int serverTick)
+    {
+        if (serverTick <= 0)
+        {
+            return;
+        }
+
+        if (lastReceivedSnapshotTick > 0 && serverTick > lastReceivedSnapshotTick + 1)
+        {
+            estimatedMissedSnapshotCount += serverTick - lastReceivedSnapshotTick - 1;
+        }
+
+        if (serverTick > lastReceivedSnapshotTick)
+        {
+            lastReceivedSnapshotTick = serverTick;
+            lastSnapshotReceivedTime = Time.time;
+            receivedSnapshotCount++;
+        }
+    }
+
+    private void UpdateRttFromAcknowledgedInput(int acknowledgedInputTick)
+    {
+        if (acknowledgedInputTick <= 0)
+        {
+            return;
+        }
+
+        for (int i = localInputHistory.Count - 1; i >= 0; i--)
+        {
+            if (localInputHistory[i].InputTick > acknowledgedInputTick)
+            {
+                continue;
+            }
+
+            lastRttSampleSeconds = Mathf.Max(0f, Time.time - localInputHistory[i].SentTime);
+            smoothedRttSeconds = hasMeasuredRtt
+                ? Mathf.Lerp(smoothedRttSeconds, lastRttSampleSeconds, 0.2f)
+                : lastRttSampleSeconds;
+            hasMeasuredRtt = true;
+            return;
+        }
     }
 
     private void RemoveAcknowledgedLocalInputs(int acknowledgedInputTick)
@@ -668,7 +938,7 @@ public class UdpNetworkClient : MonoBehaviour
 
         if (correctionDistance >= adjustedHardCorrectionDistance)
         {
-            predictionCorrectionCount++;
+            RecordPredictionCorrection(true);
             ApplyReconciledLocalStateImmediately(reconciledState);
 
             if (logLocalPrediction)
@@ -696,7 +966,7 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
-        predictionCorrectionCount++;
+        RecordPredictionCorrection(false);
         SmoothToReconciledLocalState(reconciledState, adjustedDeadZone);
 
         if (logLocalPrediction)
@@ -718,6 +988,40 @@ public class UdpNetworkClient : MonoBehaviour
         TankInputData currentInput = localTank.CurrentInput;
         return Mathf.Abs(currentInput.MoveAxis) > activeInputDeadZone
             || Mathf.Abs(currentInput.TurnAxis) > activeInputDeadZone;
+    }
+
+    private void RecordPredictionCorrection(bool isHardCorrection)
+    {
+        predictionCorrectionCount++;
+
+        if (isHardCorrection)
+        {
+            hardPredictionCorrectionCount++;
+        }
+        else
+        {
+            smoothPredictionCorrectionCount++;
+        }
+
+        recentPredictionCorrectionTimes.Enqueue(Time.time);
+        TrimRecentPredictionCorrections();
+    }
+
+    private int GetRecentPredictionCorrectionCount()
+    {
+        TrimRecentPredictionCorrections();
+        return recentPredictionCorrectionTimes.Count;
+    }
+
+    private void TrimRecentPredictionCorrections()
+    {
+        const float recentWindowSeconds = 5f;
+
+        while (recentPredictionCorrectionTimes.Count > 0
+            && Time.time - recentPredictionCorrectionTimes.Peek() > recentWindowSeconds)
+        {
+            recentPredictionCorrectionTimes.Dequeue();
+        }
     }
 
     private ReconciledLocalState BuildReconciledLocalState(PlayerSnapshotMessage snapshot)
@@ -827,9 +1131,7 @@ public class UdpNetworkClient : MonoBehaviour
         {
             localAvatar.ApplyServerStateImmediately(
                 reconciledState.Position,
-                reconciledState.Rotation,
-                reconciledState.AimX,
-                reconciledState.AimZ);
+                reconciledState.Rotation);
             return;
         }
 
@@ -841,13 +1143,15 @@ public class UdpNetworkClient : MonoBehaviour
     {
         if (localAvatar != null)
         {
+            bool includeRotation = !IsLocalTurnInputActive();
+
             localAvatar.SmoothToPredictedServerState(
                 reconciledState.Position,
                 reconciledState.Rotation,
-                reconciledState.AimX,
-                reconciledState.AimZ,
                 smoothCorrectionSpeed,
-                stopDistance);
+                smoothCorrectionMaxSeconds,
+                stopDistance,
+                includeRotation);
             return;
         }
 
@@ -859,6 +1163,16 @@ public class UdpNetworkClient : MonoBehaviour
             localTank.transform.rotation,
             reconciledState.Rotation,
             Time.deltaTime * smoothCorrectionSpeed);
+    }
+
+    private bool IsLocalTurnInputActive()
+    {
+        if (localTank == null)
+        {
+            return false;
+        }
+
+        return Mathf.Abs(localTank.CurrentInput.TurnAxis) > activeInputDeadZone;
     }
 
     private NetworkTankAvatar GetOrCreateRemoteAvatar(PlayerSnapshotMessage snapshot)
@@ -893,6 +1207,7 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         avatar.SetNetworkAuthorityMode(true);
+        avatar.SetPlayerInfo(snapshot.playerId, false);
         avatar.SetRemoteInterpolation(
             interpolateRemotePlayers,
             GetRemoteInterpolationDelayTicks(),
@@ -938,6 +1253,239 @@ public class UdpNetworkClient : MonoBehaviour
         {
             tankInput.enabled = false;
         }
+    }
+
+    private void ToggleDebugPanelIfRequested()
+    {
+        if (debugPanelToggleKey == KeyCode.None)
+        {
+            return;
+        }
+
+        if (Input.GetKeyDown(debugPanelToggleKey))
+        {
+            showNetworkDebugPanel = !showNetworkDebugPanel;
+        }
+    }
+
+    private void DrawNetworkDebugPanel()
+    {
+        if (!showNetworkDebugPanel)
+        {
+            return;
+        }
+
+        EnsureDebugPanelStyles();
+
+        const int debugRowCount = 16;
+        const float titleHeight = 28f;
+        const float rowHeight = 24f;
+        const float panelPaddingHeight = 28f;
+
+        float maxPanelWidth = Mathf.Max(280f, Screen.width - 24f);
+        float safeWidth = Mathf.Clamp(debugPanelWidth, 280f, maxPanelWidth);
+        float wantedHeight = titleHeight + debugRowCount * rowHeight + panelPaddingHeight;
+        float maxPanelHeight = Mathf.Max(180f, Screen.height - debugPanelPosition.y - 12f);
+        float safeHeight = Mathf.Min(wantedHeight, maxPanelHeight);
+        Rect panelRect = new Rect(debugPanelPosition.x, debugPanelPosition.y, safeWidth, safeHeight);
+
+        GUILayout.BeginArea(panelRect, debugPanelBoxStyle);
+        debugPanelScrollPosition = GUILayout.BeginScrollView(debugPanelScrollPosition, false, true);
+        GUILayout.Label($"Network Debug ({debugPanelToggleKey})", debugTitleStyle);
+        DrawDebugRow("Player ID", playerId > 0 ? playerId.ToString() : "waiting");
+        DrawDebugRow("Connection", GetConnectionStateText());
+        DrawDebugRow("RTT", FormatRttText());
+        DrawDebugRow("World ticks", FormatWorldTickText());
+        DrawDebugRow("Input ticks", FormatInputTickText());
+        DrawDebugRow("Snapshot buffer", $"{GetTotalRemoteSnapshotBufferCount()} remote snapshots");
+        DrawDebugRow("Smooth corrections", smoothPredictionCorrectionCount.ToString());
+        DrawDebugRow("Hard corrections", hardPredictionCorrectionCount.ToString());
+        DrawDebugRow("Corrections (5s)", GetRecentPredictionCorrectionCount().ToString());
+        DrawDebugRow("Latest prediction error", $"{lastPredictionCorrectionDistance:F3} m");
+        DrawDebugRow("Snapshot delivery", FormatSnapshotDeliveryText());
+        DrawDebugRow("Snapshot processing", FormatSkippedSnapshotText());
+        DrawDebugRow("Fire lag compensation", FormatLagCompensationText());
+        DrawDebugRow("Correction budget", FormatCorrectionBudgetText());
+        DrawDebugRow("Smooth correction", $"{smoothCorrectionSpeed:F1}/s, max {smoothCorrectionMaxSeconds:F2}s");
+        DrawDebugRow("Remote interpolation", $"{remoteInterpolationDelaySeconds:F3}s ({GetRemoteInterpolationDelayTicks()} ticks)");
+        GUILayout.EndScrollView();
+        GUILayout.EndArea();
+    }
+
+    private void EnsureDebugPanelStyles()
+    {
+        if (debugPanelBoxStyle != null)
+        {
+            return;
+        }
+
+        debugPanelBoxStyle = new GUIStyle(GUI.skin.box);
+        debugPanelBoxStyle.alignment = TextAnchor.UpperLeft;
+        debugPanelBoxStyle.padding = new RectOffset(12, 12, 10, 10);
+
+        debugTitleStyle = new GUIStyle(GUI.skin.label);
+        debugTitleStyle.fontStyle = FontStyle.Bold;
+        debugTitleStyle.fontSize = 15;
+        debugTitleStyle.normal.textColor = Color.white;
+
+        debugRowNameStyle = new GUIStyle(GUI.skin.label);
+        debugRowNameStyle.normal.textColor = new Color(0.8f, 0.9f, 1f);
+
+        debugRowValueStyle = new GUIStyle(GUI.skin.label);
+        debugRowValueStyle.alignment = TextAnchor.MiddleRight;
+        debugRowValueStyle.wordWrap = true;
+        debugRowValueStyle.normal.textColor = Color.white;
+    }
+
+    private void DrawDebugRow(string name, string value)
+    {
+        GUILayout.BeginHorizontal();
+        GUILayout.Label(name, debugRowNameStyle, GUILayout.Width(165f));
+        GUILayout.Label(value, debugRowValueStyle);
+        GUILayout.EndHorizontal();
+    }
+
+    private string GetConnectionStateText()
+    {
+        if (udpClient == null)
+        {
+            return "Socket closed";
+        }
+
+        if (playerId == 0)
+        {
+            return "Socket open, waiting welcome";
+        }
+
+        if (lastReceivedSnapshotTick == 0)
+        {
+            return "Welcome received, waiting snapshot";
+        }
+
+        float secondsSinceSnapshot = Time.time - lastSnapshotReceivedTime;
+
+        if (secondsSinceSnapshot > 1.5f)
+        {
+            return $"Connected, snapshot stale {secondsSinceSnapshot:F1}s";
+        }
+
+        return isLocalAlive ? "Connected, alive" : "Connected, dead";
+    }
+
+    private string FormatRttText()
+    {
+        if (hasMeasuredRtt)
+        {
+            return $"{FormatSecondsAsMilliseconds(smoothedRttSeconds)} (last {FormatSecondsAsMilliseconds(lastRttSampleSeconds)})";
+        }
+
+        if (playerId == 0 || !hasAuthoritativeLocalSnapshot)
+        {
+            return "--";
+        }
+
+        return $"{FormatSecondsAsMilliseconds(EstimateLocalRttSeconds())} estimated";
+    }
+
+    private float GetDisplayedRttSeconds()
+    {
+        if (hasMeasuredRtt)
+        {
+            return smoothedRttSeconds;
+        }
+
+        if (playerId == 0 || !hasAuthoritativeLocalSnapshot)
+        {
+            return 0f;
+        }
+
+        return EstimateLocalRttSeconds();
+    }
+
+    private int GetEstimatedServerTick()
+    {
+        if (lastReceivedSnapshotTick <= 0)
+        {
+            return 0;
+        }
+
+        float secondsSinceSnapshot = Mathf.Max(0f, Time.time - lastSnapshotReceivedTime);
+        int ticksSinceSnapshot = Mathf.RoundToInt(secondsSinceSnapshot * Mathf.Max(1f, inputTickRate));
+        return lastReceivedSnapshotTick + ticksSinceSnapshot;
+    }
+
+    private string FormatWorldTickText()
+    {
+        if (lastReceivedSnapshotTick <= 0)
+        {
+            return "waiting for snapshot";
+        }
+
+        return $"server {GetEstimatedServerTick()}, snapshot {lastReceivedSnapshotTick}";
+    }
+
+    private string FormatInputTickText()
+    {
+        return $"local {inputTick}, ack {lastProcessedLocalInputTick}";
+    }
+
+    private string FormatCorrectionBudgetText()
+    {
+        return $"soft {GetAdjustedDeadZone():F2}m, hard {GetAdjustedHardCorrectionDistance():F2}m";
+    }
+
+    private int GetTotalRemoteSnapshotBufferCount()
+    {
+        int total = 0;
+
+        foreach (NetworkTankAvatar remoteAvatar in remoteAvatars.Values)
+        {
+            if (remoteAvatar != null)
+            {
+                total += remoteAvatar.RemoteSnapshotBufferCount;
+            }
+        }
+
+        return total;
+    }
+
+    private float GetEstimatedSnapshotLossRate()
+    {
+        int expectedSnapshots = receivedSnapshotCount + estimatedMissedSnapshotCount;
+
+        if (expectedSnapshots <= 0)
+        {
+            return 0f;
+        }
+
+        return estimatedMissedSnapshotCount / (float)expectedSnapshots;
+    }
+
+    private string FormatSnapshotDeliveryText()
+    {
+        float lossPercent = GetEstimatedSnapshotLossRate() * 100f;
+        return $"{lossPercent:F1}% loss, {estimatedMissedSnapshotCount}/{receivedSnapshotCount} missed";
+    }
+
+    private string FormatSkippedSnapshotText()
+    {
+        return $"{collapsedSnapshotCount} batched, {discardedStaleSnapshotCount} stale";
+    }
+
+    private string FormatLagCompensationText()
+    {
+        if (lastLagCompensationHitTestServerTick <= 0)
+        {
+            return "--";
+        }
+
+        string enabledText = lastFireUsedLagCompensation ? "on" : "off";
+        return $"{enabledText}, rewind {lastLagCompensationRewindSeconds * 1000f:F0} ms, tick {lastLagCompensationHitTestServerTick}";
+    }
+
+    private string FormatSecondsAsMilliseconds(float seconds)
+    {
+        return $"{seconds * 1000f:F0} ms";
     }
 
     private void CloseSocket()
@@ -1000,6 +1548,8 @@ public class FireRequestMessage
     public float directionX;
     public float directionY;
     public float directionZ;
+    public float estimatedRttSeconds;
+    public float interpolationDelaySeconds;
 }
 
 [Serializable]
@@ -1021,6 +1571,10 @@ public class PlayerSnapshotMessage
     public float aimX;
     public float aimZ;
     public int lastProcessedInputTick;
+    public int health;
+    public int maxHealth;
+    public bool isAlive;
+    public float respawnRemainingSeconds;
 }
 
 [Serializable]
@@ -1037,6 +1591,9 @@ public class FireEventMessage
     public float directionY;
     public float directionZ;
     public float range;
+    public bool lagCompensated;
+    public int hitTestServerTick;
+    public float rewindSeconds;
 }
 
 [Serializable]
@@ -1061,6 +1618,7 @@ public class HealthChangedEventMessage
     public int health;
     public int maxHealth;
     public bool isAlive;
+    public float respawnRemainingSeconds;
 }
 
 public struct BufferedLocalInput

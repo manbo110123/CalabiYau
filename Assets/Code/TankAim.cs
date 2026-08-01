@@ -35,7 +35,7 @@ public class TankAim : MonoBehaviour
         }
     }
 
-    public void ApplyTowerRotation()
+    public void ApplyTowerRotation(float deltaTime)
     {
         if (tankTower == null || aimTransform == null)
         {
@@ -51,6 +51,9 @@ public class TankAim : MonoBehaviour
         }
 
         Quaternion targetRotation = Quaternion.LookRotation(direction);
-        tankTower.rotation = Quaternion.RotateTowards(tankTower.rotation, targetRotation, towerRotationSpeed);
+        // Existing prefabs store this as degrees per physics step. Convert it
+        // to a frame-rate-independent visual rotation without changing prefab data.
+        float maxDegreesDelta = towerRotationSpeed * deltaTime / Time.fixedDeltaTime;
+        tankTower.rotation = Quaternion.RotateTowards(tankTower.rotation, targetRotation, maxDegreesDelta);
     }
 }

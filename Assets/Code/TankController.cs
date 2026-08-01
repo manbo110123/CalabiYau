@@ -58,6 +58,7 @@ public class TankController : MonoBehaviour
     {
         currentInput = tankInput.ReadInput();
         tankAim.UpdateAimPoint(currentInput.MouseScreenPosition);
+        tankAim.ApplyTowerRotation(Time.deltaTime);
 
         if (applyLocalWeapon)
         {
@@ -72,8 +73,6 @@ public class TankController : MonoBehaviour
             tankMotor.ApplyMovement(currentInput);
             tankMotor.ApplyBodyRotation(currentInput);
         }
-
-        tankAim.ApplyTowerRotation();
     }
 
     public void SetLocalMovementEnabled(bool isEnabled)

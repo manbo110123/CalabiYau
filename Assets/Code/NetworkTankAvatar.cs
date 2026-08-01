@@ -12,10 +12,20 @@ public class NetworkTankAvatar : MonoBehaviour
     [Header("Combat feedback")]
     [SerializeField] private Color hitFlashColor = Color.red;
     [SerializeField] private float hitFlashSeconds = 0.15f;
+    [SerializeField] private Color deathTintColor = Color.gray;
+
+    [Header("Status UI")]
+    [SerializeField] private bool showWorldStatus = true;
+    [SerializeField] private Vector3 statusWorldOffset = new Vector3(0f, 2.2f, 0f);
+    [SerializeField] private Color aliveStatusColor = Color.white;
+    [SerializeField] private Color deadStatusColor = Color.red;
 
     private Rigidbody tankRigidbody;
     private Renderer[] renderers;
     private Color[] originalColors;
+    private GUIStyle statusLabelStyle;
+    private int playerId;
+    private bool isLocalPlayer;
     private bool useNetworkAuthorityMode;
     private bool hasPendingServerState;
     private Vector3 pendingPosition;
@@ -29,19 +39,23 @@ public class NetworkTankAvatar : MonoBehaviour
     private bool hasLocalPredictionCorrectionTarget;
     private Vector3 localCorrectionTargetPosition;
     private Quaternion localCorrectionTargetRotation;
-    private float localCorrectionTargetAimX;
-    private float localCorrectionTargetAimZ;
+    private bool localCorrectionIncludesRotation;
     private float localCorrectionSpeed = 10f;
+    private float localCorrectionMaxSeconds = 0.5f;
     private float localCorrectionStopDistance = 0.02f;
+    private float localCorrectionStartedAt;
     private float hitFlashTimer;
     private int currentHealth = 100;
     private int maxHealth = 100;
     private bool isAlive = true;
+    private float respawnRemainingSeconds;
     private readonly List<BufferedServerState> remoteSnapshotBuffer = new List<BufferedServerState>();
 
     public int CurrentHealth => currentHealth;
     public int MaxHealth => maxHealth;
     public bool IsAlive => isAlive;
+    public float RespawnRemainingSeconds => respawnRemainingSeconds;
+    public int RemoteSnapshotBufferCount => remoteSnapshotBuffer.Count;
 
     private void Awake()
     {
@@ -68,11 +82,16 @@ public class NetworkTankAvatar : MonoBehaviour
 
         hasPendingServerState = false;
         ApplyBodyState(pendingPosition, pendingRotation);
-        ApplyAimState(pendingAimX, pendingAimZ);
+
+        if (!isLocalPlayer)
+        {
+            ApplyAimState(pendingAimX, pendingAimZ);
+        }
     }
 
     private void Update()
     {
+        UpdateRespawnCountdown();
         UpdateHitFlash();
 
         if (!useRemoteInterpolation)
@@ -82,6 +101,17 @@ public class NetworkTankAvatar : MonoBehaviour
         }
 
         PlayRemoteSnapshotBuffer();
+    }
+
+    private void OnGUI()
+    {
+        DrawWorldStatus();
+    }
+
+    public void SetPlayerInfo(int newPlayerId, bool newIsLocalPlayer)
+    {
+        playerId = newPlayerId;
+        isLocalPlayer = newIsLocalPlayer;
     }
 
     public void SetNetworkAuthorityMode(bool isEnabled)
@@ -112,28 +142,32 @@ public class NetworkTankAvatar : MonoBehaviour
         hasPendingServerState = true;
     }
 
-    public void ApplyServerStateImmediately(Vector3 position, Quaternion rotation, float aimX, float aimZ)
+    public void ApplyServerStateImmediately(Vector3 position, Quaternion rotation)
     {
         hasPendingServerState = false;
         hasLocalPredictionCorrectionTarget = false;
         ApplyBodyStateDirectly(position, rotation);
-        ApplyAimState(aimX, aimZ);
     }
 
     public void SmoothToPredictedServerState(
         Vector3 position,
         Quaternion rotation,
-        float aimX,
-        float aimZ,
         float correctionSpeed,
-        float stopDistance)
+        float maxCorrectionSeconds,
+        float stopDistance,
+        bool includeRotation)
     {
         localCorrectionTargetPosition = position;
         localCorrectionTargetRotation = rotation;
-        localCorrectionTargetAimX = aimX;
-        localCorrectionTargetAimZ = aimZ;
+        localCorrectionIncludesRotation = includeRotation;
         localCorrectionSpeed = Mathf.Max(0.1f, correctionSpeed);
+        localCorrectionMaxSeconds = Mathf.Max(0.01f, maxCorrectionSeconds);
         localCorrectionStopDistance = Mathf.Max(0.001f, stopDistance);
+        if (!hasLocalPredictionCorrectionTarget)
+        {
+            localCorrectionStartedAt = Time.time;
+        }
+
         hasLocalPredictionCorrectionTarget = true;
     }
 
@@ -207,10 +241,26 @@ public class NetworkTankAvatar : MonoBehaviour
 
     public void ApplyNetworkHealth(int health, int newMaxHealth, bool newIsAlive)
     {
+        bool changed = currentHealth != health || maxHealth != Mathf.Max(1, newMaxHealth) || isAlive != newIsAlive;
+
         currentHealth = health;
         maxHealth = Mathf.Max(1, newMaxHealth);
         isAlive = newIsAlive;
-        Debug.Log($"{name} health={currentHealth}/{maxHealth}, alive={isAlive}");
+
+        if (changed)
+        {
+            if (hitFlashTimer <= 0f)
+            {
+                ApplyBaseRendererColor();
+            }
+
+            Debug.Log($"{name} health={currentHealth}/{maxHealth}, alive={isAlive}");
+        }
+    }
+
+    public void SetRespawnRemainingSeconds(float seconds)
+    {
+        respawnRemainingSeconds = Mathf.Max(0f, seconds);
     }
 
     private void PlayRemoteSnapshotBuffer()
@@ -285,21 +335,30 @@ public class NetworkTankAvatar : MonoBehaviour
 
         if (distance <= localCorrectionStopDistance)
         {
-            ApplyServerStateImmediately(
-                localCorrectionTargetPosition,
-                localCorrectionTargetRotation,
-                localCorrectionTargetAimX,
-                localCorrectionTargetAimZ);
+            Quaternion finalRotation = localCorrectionIncludesRotation
+                ? localCorrectionTargetRotation
+                : (bodyTransform != null ? bodyTransform.rotation : transform.rotation);
+            ApplyServerStateImmediately(localCorrectionTargetPosition, finalRotation);
+            return;
+        }
+
+        if (Time.time - localCorrectionStartedAt >= localCorrectionMaxSeconds)
+        {
+            Quaternion finalRotation = localCorrectionIncludesRotation
+                ? localCorrectionTargetRotation
+                : (bodyTransform != null ? bodyTransform.rotation : transform.rotation);
+            ApplyServerStateImmediately(localCorrectionTargetPosition, finalRotation);
             return;
         }
 
         float lerpAmount = 1f - Mathf.Exp(-localCorrectionSpeed * Time.deltaTime);
         Vector3 smoothedPosition = Vector3.Lerp(currentPosition, localCorrectionTargetPosition, lerpAmount);
         Quaternion currentRotation = bodyTransform != null ? bodyTransform.rotation : transform.rotation;
-        Quaternion smoothedRotation = Quaternion.Slerp(currentRotation, localCorrectionTargetRotation, lerpAmount);
+        Quaternion smoothedRotation = localCorrectionIncludesRotation
+            ? Quaternion.Slerp(currentRotation, localCorrectionTargetRotation, lerpAmount)
+            : currentRotation;
 
         ApplyBodyStateDirectly(smoothedPosition, smoothedRotation);
-        ApplyAimState(localCorrectionTargetAimX, localCorrectionTargetAimZ);
     }
 
     private void CacheRenderers()
@@ -324,8 +383,18 @@ public class NetworkTankAvatar : MonoBehaviour
 
         if (hitFlashTimer <= 0f)
         {
-            RestoreRendererColors();
+            ApplyBaseRendererColor();
         }
+    }
+
+    private void UpdateRespawnCountdown()
+    {
+        if (isAlive || respawnRemainingSeconds <= 0f)
+        {
+            return;
+        }
+
+        respawnRemainingSeconds = Mathf.Max(0f, respawnRemainingSeconds - Time.deltaTime);
     }
 
     private void SetRendererColor(Color color)
@@ -341,6 +410,17 @@ public class NetworkTankAvatar : MonoBehaviour
         }
     }
 
+    private void ApplyBaseRendererColor()
+    {
+        if (!isAlive)
+        {
+            SetRendererColor(deathTintColor);
+            return;
+        }
+
+        RestoreRendererColors();
+    }
+
     private void RestoreRendererColors()
     {
         if (renderers == null || originalColors == null)
@@ -354,6 +434,58 @@ public class NetworkTankAvatar : MonoBehaviour
         {
             renderers[i].material.color = originalColors[i];
         }
+    }
+
+    private void DrawWorldStatus()
+    {
+        if (!showWorldStatus || Camera.main == null)
+        {
+            return;
+        }
+
+        Vector3 anchorPosition = (bodyTransform != null ? bodyTransform.position : transform.position) + statusWorldOffset;
+        Vector3 screenPosition = Camera.main.WorldToScreenPoint(anchorPosition);
+
+        if (screenPosition.z <= 0f)
+        {
+            return;
+        }
+
+        EnsureStatusLabelStyle();
+
+        string playerLabel = playerId > 0 ? $"P{playerId}" : "P?";
+
+        if (isLocalPlayer)
+        {
+            playerLabel = $"You {playerLabel}";
+        }
+
+        string statusText = isAlive
+            ? $"{playerLabel}  HP {currentHealth}/{maxHealth}"
+            : $"{playerLabel}  DEAD  {respawnRemainingSeconds:F1}s";
+
+        statusLabelStyle.normal.textColor = isAlive ? aliveStatusColor : deadStatusColor;
+        Vector2 size = statusLabelStyle.CalcSize(new GUIContent(statusText));
+        Rect labelRect = new Rect(
+            screenPosition.x - size.x * 0.5f,
+            Screen.height - screenPosition.y - size.y * 0.5f,
+            size.x,
+            size.y);
+
+        GUI.Label(labelRect, statusText, statusLabelStyle);
+    }
+
+    private void EnsureStatusLabelStyle()
+    {
+        if (statusLabelStyle != null)
+        {
+            return;
+        }
+
+        statusLabelStyle = new GUIStyle(GUI.skin.label);
+        statusLabelStyle.alignment = TextAnchor.MiddleCenter;
+        statusLabelStyle.fontStyle = FontStyle.Bold;
+        statusLabelStyle.fontSize = 14;
     }
 
     private void RemoveSnapshotsOlderThan(int serverTick)

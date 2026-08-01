@@ -494,6 +494,11 @@ PrefabInstance:
   m_Modification:
     m_TransformParent: {fileID: 0}
     m_Modifications:
+    - target: {fileID: 3412212381769644642, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
+        type: 3}
+      propertyPath: m_Enabled
+      value: 0
+      objectReference: {fileID: 0}
     - target: {fileID: 3412212381769644643, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
         type: 3}
       propertyPath: aimTransform
@@ -522,7 +527,7 @@ PrefabInstance:
     - target: {fileID: 3412212381769644653, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
         type: 3}
       propertyPath: m_LocalPosition.y
-      value: 0
+      value: 0.45
       objectReference: {fileID: 0}
     - target: {fileID: 3412212381769644653, guid: 21b6b0bb5e9ad7d4593b30c731dfffec,
         type: 3}
@@ -976,12 +981,15 @@ MonoBehaviour:
   hardCorrectionBaseDistance: 1.25
   rttCorrectionThresholdScale: 0.5
   smoothCorrectionSpeed: 5
+  smoothCorrectionWhileInputActive: 1
+  activeInputDeadZone: 0.05
   interpolateRemotePlayers: 1
   remoteInterpolationDelaySeconds: 0.1
   remoteInterpolationBufferSize: 8
-  logJsonMessages: 1
+  logJsonMessages: 0
   logSnapshots: 0
   logLocalPrediction: 0
+  logGameplayEvents: 1
 --- !u!4 &1907406081
 Transform:
   m_ObjectHideFlags: 0
