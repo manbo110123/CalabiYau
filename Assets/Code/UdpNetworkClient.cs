@@ -39,7 +39,8 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private float rttCorrectionThresholdScale = 0.5f;
     [SerializeField] private float smoothCorrectionSpeed = 5f;
     [SerializeField] private float smoothCorrectionMaxSeconds = 0.5f;
-    [SerializeField] private bool smoothCorrectionWhileInputActive = true;
+    [SerializeField] private bool deferPredictionCorrectionWhileInputActive = true;
+    [SerializeField] private float predictionCorrectionInputGraceSeconds = 0.2f;
     [SerializeField] private float activeInputDeadZone = 0.05f;
 
     [Header("Remote Interpolation")]
@@ -73,6 +74,7 @@ public class UdpNetworkClient : MonoBehaviour
     private int smoothPredictionCorrectionCount;
     private int hardPredictionCorrectionCount;
     private float lastPredictionCorrectionDistance;
+    private float lastLocalMovementInputTime = float.NegativeInfinity;
     private int sentFireRequestCount;
     private int receivedGameplayEventCount;
     private bool isLocalAlive = true;
@@ -83,6 +85,8 @@ public class UdpNetworkClient : MonoBehaviour
     private int estimatedMissedSnapshotCount;
     private int discardedStaleSnapshotCount;
     private int collapsedSnapshotCount;
+    private int lastReplicationScopePlayerCount;
+    private int removedRemoteAvatarCount;
     private bool hasMeasuredRtt;
     private float smoothedRttSeconds;
     private float lastRttSampleSeconds;
@@ -145,7 +149,20 @@ public class UdpNetworkClient : MonoBehaviour
 
     private void OnApplicationQuit()
     {
+        SendClientGoodbye();
         CloseSocket();
+    }
+
+    private void SendClientGoodbye()
+    {
+        if (udpClient == null || playerId == 0)
+        {
+            return;
+        }
+
+        ClientGoodbyeMessage message = new ClientGoodbyeMessage();
+        message.type = "ClientGoodbye";
+        SendJson(JsonUtility.ToJson(message));
     }
 
     private void OnGUI()
@@ -547,13 +564,15 @@ public class UdpNetworkClient : MonoBehaviour
 
         if (logSnapshots)
         {
-            Debug.Log($"WorldSnapshot tick={snapshot.serverTick}, players={snapshot.players.Length}");
+            Debug.Log($"WorldSnapshot tick={snapshot.serverTick}, statePlayers={snapshot.players.Length}, scopePlayers={GetReplicationScopePlayerIds(snapshot).Count}");
         }
 
         for (int i = 0; i < snapshot.players.Length; i++)
         {
             ApplyPlayerSnapshot(snapshot.serverTick, snapshot.players[i]);
         }
+
+        RemoveRemoteAvatarsOutsideReplicationScope(GetReplicationScopePlayerIds(snapshot));
     }
 
     private void HandleFireEvent(string json)
@@ -822,6 +841,7 @@ public class UdpNetworkClient : MonoBehaviour
         smoothPredictionCorrectionCount = 0;
         hardPredictionCorrectionCount = 0;
         lastPredictionCorrectionDistance = 0f;
+        lastLocalMovementInputTime = float.NegativeInfinity;
         recentPredictionCorrectionTimes.Clear();
         localInputHistory.Clear();
     }
@@ -835,6 +855,8 @@ public class UdpNetworkClient : MonoBehaviour
         estimatedMissedSnapshotCount = 0;
         discardedStaleSnapshotCount = 0;
         collapsedSnapshotCount = 0;
+        lastReplicationScopePlayerCount = 0;
+        removedRemoteAvatarCount = 0;
         hasMeasuredRtt = false;
         smoothedRttSeconds = 0f;
         lastRttSampleSeconds = 0f;
@@ -936,6 +958,26 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
+        // The predicted Rigidbody is already written by TankMotor in FixedUpdate. Applying
+        // a cosmetic correction target while the player is holding movement causes a small
+        // but noticeable tug-of-war. Defer it until input becomes idle instead.
+        if (deferPredictionCorrectionWhileInputActive && HasRecentLocalMovementInput())
+        {
+            if (localAvatar != null)
+            {
+                localAvatar.CancelLocalPredictionCorrection();
+            }
+
+            if (logLocalPrediction)
+            {
+                Debug.Log(
+                    $"Prediction correction deferred during active input: " +
+                    $"distance={correctionDistance:F3}, pendingInputs={localInputHistory.Count}");
+            }
+
+            return;
+        }
+
         if (correctionDistance >= adjustedHardCorrectionDistance)
         {
             RecordPredictionCorrection(true);
@@ -952,22 +994,12 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
-        if (!smoothCorrectionWhileInputActive && IsLocalMovementInputActive())
+        bool startedNewCorrection = SmoothToReconciledLocalState(reconciledState, adjustedDeadZone);
+
+        if (startedNewCorrection)
         {
-            if (logLocalPrediction)
-            {
-                Debug.Log(
-                    $"Prediction smooth correction delayed while input is active: " +
-                    $"distance={correctionDistance:F3}, " +
-                    $"hardThreshold={adjustedHardCorrectionDistance:F3}, " +
-                    $"pendingInputs={localInputHistory.Count}");
-            }
-
-            return;
+            RecordPredictionCorrection(false);
         }
-
-        RecordPredictionCorrection(false);
-        SmoothToReconciledLocalState(reconciledState, adjustedDeadZone);
 
         if (logLocalPrediction)
         {
@@ -988,6 +1020,17 @@ public class UdpNetworkClient : MonoBehaviour
         TankInputData currentInput = localTank.CurrentInput;
         return Mathf.Abs(currentInput.MoveAxis) > activeInputDeadZone
             || Mathf.Abs(currentInput.TurnAxis) > activeInputDeadZone;
+    }
+
+    private bool HasRecentLocalMovementInput()
+    {
+        if (IsLocalMovementInputActive())
+        {
+            lastLocalMovementInputTime = Time.time;
+            return true;
+        }
+
+        return Time.time - lastLocalMovementInputTime < Mathf.Max(0f, predictionCorrectionInputGraceSeconds);
     }
 
     private void RecordPredictionCorrection(bool isHardCorrection)
@@ -1139,20 +1182,19 @@ public class UdpNetworkClient : MonoBehaviour
         localTank.transform.rotation = reconciledState.Rotation;
     }
 
-    private void SmoothToReconciledLocalState(ReconciledLocalState reconciledState, float stopDistance)
+    private bool SmoothToReconciledLocalState(ReconciledLocalState reconciledState, float stopDistance)
     {
         if (localAvatar != null)
         {
             bool includeRotation = !IsLocalTurnInputActive();
 
-            localAvatar.SmoothToPredictedServerState(
+            return localAvatar.SmoothToPredictedServerState(
                 reconciledState.Position,
                 reconciledState.Rotation,
                 smoothCorrectionSpeed,
                 smoothCorrectionMaxSeconds,
                 stopDistance,
                 includeRotation);
-            return;
         }
 
         localTank.transform.position = Vector3.Lerp(
@@ -1163,6 +1205,7 @@ public class UdpNetworkClient : MonoBehaviour
             localTank.transform.rotation,
             reconciledState.Rotation,
             Time.deltaTime * smoothCorrectionSpeed);
+        return true;
     }
 
     private bool IsLocalTurnInputActive()
@@ -1215,6 +1258,64 @@ public class UdpNetworkClient : MonoBehaviour
             remoteInterpolationBufferSize);
         remoteAvatars.Add(snapshot.playerId, avatar);
         return avatar;
+    }
+
+    // A per-client snapshot can intentionally omit a low-frequency entity's state while
+    // still listing it in replicatedPlayerIds. Only an entity outside that list is removed.
+    // For snapshots from an older server, fall back to the state entries themselves.
+    private HashSet<int> GetReplicationScopePlayerIds(WorldSnapshotMessage snapshot)
+    {
+        HashSet<int> scopePlayerIds = new HashSet<int>();
+
+        if (snapshot.replicatedPlayerIds != null && snapshot.replicatedPlayerIds.Length > 0)
+        {
+            for (int i = 0; i < snapshot.replicatedPlayerIds.Length; i++)
+            {
+                scopePlayerIds.Add(snapshot.replicatedPlayerIds[i]);
+            }
+        }
+        else if (snapshot.players != null)
+        {
+            for (int i = 0; i < snapshot.players.Length; i++)
+            {
+                scopePlayerIds.Add(snapshot.players[i].playerId);
+            }
+        }
+
+        lastReplicationScopePlayerCount = scopePlayerIds.Count;
+        return scopePlayerIds;
+    }
+
+    private void RemoveRemoteAvatarsOutsideReplicationScope(HashSet<int> scopePlayerIds)
+    {
+        List<int> playerIdsToRemove = new List<int>();
+
+        foreach (KeyValuePair<int, NetworkTankAvatar> pair in remoteAvatars)
+        {
+            if (!scopePlayerIds.Contains(pair.Key))
+            {
+                playerIdsToRemove.Add(pair.Key);
+            }
+        }
+
+        for (int i = 0; i < playerIdsToRemove.Count; i++)
+        {
+            int remotePlayerId = playerIdsToRemove[i];
+
+            if (remoteAvatars.TryGetValue(remotePlayerId, out NetworkTankAvatar avatar) && avatar != null)
+            {
+                Destroy(avatar.gameObject);
+            }
+
+            remoteAvatars.Remove(remotePlayerId);
+            warnedMissingRemotePrefab.Remove(remotePlayerId);
+            removedRemoteAvatarCount++;
+
+            if (logSnapshots)
+            {
+                Debug.Log($"Removed remote player {remotePlayerId}: it is outside this client's replication scope.");
+            }
+        }
     }
 
     private NetworkTankAvatar GetAvatarByPlayerId(int targetPlayerId)
@@ -1277,7 +1378,7 @@ public class UdpNetworkClient : MonoBehaviour
 
         EnsureDebugPanelStyles();
 
-        const int debugRowCount = 16;
+        const int debugRowCount = 18;
         const float titleHeight = 28f;
         const float rowHeight = 24f;
         const float panelPaddingHeight = 28f;
@@ -1304,10 +1405,12 @@ public class UdpNetworkClient : MonoBehaviour
         DrawDebugRow("Latest prediction error", $"{lastPredictionCorrectionDistance:F3} m");
         DrawDebugRow("Snapshot delivery", FormatSnapshotDeliveryText());
         DrawDebugRow("Snapshot processing", FormatSkippedSnapshotText());
+        DrawDebugRow("Replication scope", $"{lastReplicationScopePlayerCount} players, {remoteAvatars.Count} remote avatars");
+        DrawDebugRow("Filtered remote cleanup", removedRemoteAvatarCount.ToString());
         DrawDebugRow("Fire lag compensation", FormatLagCompensationText());
         DrawDebugRow("Correction budget", FormatCorrectionBudgetText());
         DrawDebugRow("Smooth correction", $"{smoothCorrectionSpeed:F1}/s, max {smoothCorrectionMaxSeconds:F2}s");
-        DrawDebugRow("Remote interpolation", $"{remoteInterpolationDelaySeconds:F3}s ({GetRemoteInterpolationDelayTicks()} ticks)");
+        DrawDebugRow("Remote interpolation", FormatRemoteInterpolationText());
         GUILayout.EndScrollView();
         GUILayout.EndArea();
     }
@@ -1449,6 +1552,27 @@ public class UdpNetworkClient : MonoBehaviour
         return total;
     }
 
+    private string FormatRemoteInterpolationText()
+    {
+        int baseDelayTicks = GetRemoteInterpolationDelayTicks();
+        int maximumActiveDelayTicks = baseDelayTicks;
+
+        foreach (NetworkTankAvatar remoteAvatar in remoteAvatars.Values)
+        {
+            if (remoteAvatar != null)
+            {
+                maximumActiveDelayTicks = Mathf.Max(maximumActiveDelayTicks, remoteAvatar.EffectiveRemoteInterpolationDelayTicks);
+            }
+        }
+
+        if (maximumActiveDelayTicks == baseDelayTicks)
+        {
+            return $"{remoteInterpolationDelaySeconds:F3}s ({baseDelayTicks} ticks)";
+        }
+
+        return $"base {baseDelayTicks} ticks, active {maximumActiveDelayTicks} ticks";
+    }
+
     private float GetEstimatedSnapshotLossRate()
     {
         int expectedSnapshots = receivedSnapshotCount + estimatedMissedSnapshotCount;
@@ -1558,6 +1682,14 @@ public class WorldSnapshotMessage
     public string type;
     public int serverTick;
     public PlayerSnapshotMessage[] players;
+    public int[] replicatedPlayerIds;
+    public bool isFullState;
+}
+
+[Serializable]
+public class ClientGoodbyeMessage
+{
+    public string type;
 }
 
 [Serializable]
@@ -1575,6 +1707,7 @@ public class PlayerSnapshotMessage
     public int maxHealth;
     public bool isAlive;
     public float respawnRemainingSeconds;
+    public uint changeMask;
 }
 
 [Serializable]

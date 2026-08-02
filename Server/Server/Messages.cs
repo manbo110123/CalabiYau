@@ -100,6 +100,22 @@ public sealed class WorldSnapshotMessage
 
     [JsonPropertyName("players")]
     public PlayerSnapshotMessage[] Players { get; set; } = Array.Empty<PlayerSnapshotMessage>();
+
+    // Contains every entity which remains in this client's replication scope, including
+    // low-frequency entities that did not receive a state update in this packet.
+    [JsonPropertyName("replicatedPlayerIds")]
+    public int[] ReplicatedPlayerIds { get; set; } = Array.Empty<int>();
+
+    // Delta state is intentionally not enabled until a client can acknowledge a baseline.
+    // Keeping this flag on the wire makes that future protocol change explicit.
+    [JsonPropertyName("isFullState")]
+    public bool IsFullState { get; set; } = true;
+}
+
+public sealed class ClientGoodbyeMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
 }
 
 public sealed class PlayerSnapshotMessage
@@ -139,6 +155,23 @@ public sealed class PlayerSnapshotMessage
 
     [JsonPropertyName("respawnRemainingSeconds")]
     public float RespawnRemainingSeconds { get; set; }
+
+    // Phase 11 reserves the field-level delta interface. While IsFullState is true this
+    // is always All, so UDP packet loss can never make a client depend on a prior packet.
+    [JsonPropertyName("changeMask")]
+    public uint ChangeMask { get; set; } = SnapshotChangeMasks.All;
+}
+
+public static class SnapshotChangeMasks
+{
+    public const uint Position = 1 << 0;
+    public const uint BodyYaw = 1 << 1;
+    public const uint Aim = 1 << 2;
+    public const uint LastProcessedInputTick = 1 << 3;
+    public const uint Health = 1 << 4;
+    public const uint LifeState = 1 << 5;
+    public const uint Respawn = 1 << 6;
+    public const uint All = Position | BodyYaw | Aim | LastProcessedInputTick | Health | LifeState | Respawn;
 }
 
 public sealed class FireEventMessage

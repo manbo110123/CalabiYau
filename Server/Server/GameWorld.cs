@@ -77,6 +77,13 @@ public sealed class GameWorld
         return true;
     }
 
+    // The transport owns connection lifetime; removing a player here guarantees that a
+    // disconnected endpoint cannot remain in authoritative snapshots or hit detection.
+    public bool RemovePlayer(int playerId)
+    {
+        return playersById.Remove(playerId);
+    }
+
     // This is the authoritative input gate. Transport code only creates the command and
     // identifies its sender; all sequencing and gameplay validation happens here.
     public CommandGateResult TryQueueInput(int playerId, InputCommand input)
@@ -231,6 +238,7 @@ public sealed class GameWorld
         }
 
         AcceptedFireRequestCount++;
+        shooter.LastCombatServerTick = ServerTick;
         shooter.NextAllowedFireServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(settings.FireCooldownSeconds * settings.ServerTickRate));
 
         if (shooterFrame.RewindTicks > 0)
@@ -260,6 +268,7 @@ public sealed class GameWorld
 
         if (hitPlayerId != 0 && playersById.TryGetValue(hitPlayerId, out PlayerState? hitPlayer))
         {
+            hitPlayer.LastCombatServerTick = ServerTick;
             int oldHealth = hitPlayer.Health;
             hitPlayer.Health = Math.Max(0, hitPlayer.Health - settings.FireDamage);
 
@@ -816,6 +825,7 @@ public sealed class PlayerState
     public int LastProcessedInputTick { get; internal set; }
     public int Health { get; internal set; }
     public bool IsAlive { get; internal set; }
+    public int LastCombatServerTick { get; internal set; }
     internal int NextAllowedFireServerTick { get; set; }
     internal int RespawnServerTick { get; set; }
     internal int LastHandledFireRequestTick { get; set; }

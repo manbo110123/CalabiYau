@@ -1,3 +1,5 @@
+using System.Net;
+
 internal static class Program
 {
     private static void Main()
@@ -5,8 +7,13 @@ internal static class Program
         DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward();
         InvalidAndFutureInputsAreRejectedAtTheWorldGate();
         DeadPlayersCannotQueueInputsOrFireRequests();
+        PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers();
+        LowPriorityEntitiesKeepTheirScopeButUseALowerStateRate();
+        FullSnapshotModePreservesTheChapterOneBaseline();
+        DistanceFilteringIsTheDefaultReplicationMode();
+        InactiveClientsAreRemovedFromTheRegistry();
 
-        Console.WriteLine("GameWorld command timeline checks passed.");
+        Console.WriteLine("GameWorld command timeline and stage-11 replication checks passed.");
     }
 
     private static void DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward()
@@ -63,6 +70,93 @@ internal static class Program
         bool deadFireAccepted = world.TryHandleFireRequest(2, Fire(1, 0f, 0f, -1f, 0f, 0f), out _, out string deadFireRejectReason);
         Assert(!deadFireAccepted && deadFireRejectReason.Contains("dead"), "fire request from a dead player must be rejected");
         Assert(world.FireRejectionsByReason.ContainsKey("player-dead"), "dead fire rejection should be observable");
+    }
+
+    private static void PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers()
+    {
+        GameWorld world = CreateWorldWithThreePlayers();
+        SnapshotBuilder builder = new SnapshotBuilder();
+        ClientReplicator replicator = new ClientReplicator(new ClientReplicationSettings
+        {
+            EnableDistanceFiltering = true,
+            HighPriorityDistanceMeters = 5f,
+            ReplicationDistanceMeters = 5f,
+            CombatPriorityDurationTicks = 0
+        });
+
+        ClientSnapshotPlan plan = replicator.BuildSnapshot(1, 1, 30, builder.Capture(world));
+
+        Assert(plan.Snapshot.IsFullState, "phase-11 snapshots must use the full-state fallback before baseline acknowledgement exists");
+        Assert(plan.Snapshot.Players.Select(player => player.PlayerId).SequenceEqual(new[] { 1, 2 }), "self and nearby player should have state updates");
+        Assert(plan.Snapshot.ReplicatedPlayerIds.SequenceEqual(new[] { 1, 2 }), "out-of-range player must leave this client's replication scope");
+        Assert(plan.Snapshot.Players.All(player => player.ChangeMask == SnapshotChangeMasks.All), "full fallback must mark every serialized field as available");
+    }
+
+    private static void LowPriorityEntitiesKeepTheirScopeButUseALowerStateRate()
+    {
+        GameWorld world = CreateWorldWithThreePlayers();
+        SnapshotBuilder builder = new SnapshotBuilder();
+        ClientReplicator replicator = new ClientReplicator(new ClientReplicationSettings
+        {
+            EnableDistanceFiltering = true,
+            HighPriorityDistanceMeters = 3f,
+            ReplicationDistanceMeters = 5f,
+            LowPrioritySnapshotRate = 5,
+            CombatPriorityDurationTicks = 0
+        });
+
+        ClientSnapshotPlan firstPlan = replicator.BuildSnapshot(1, 1, 30, builder.Capture(world));
+        ClientSnapshotPlan secondPlan = replicator.BuildSnapshot(1, 2, 30, builder.Capture(world));
+        ClientSnapshotPlan sixthTickPlan = replicator.BuildSnapshot(1, 7, 30, builder.Capture(world));
+
+        Assert(firstPlan.Snapshot.Players.Select(player => player.PlayerId).SequenceEqual(new[] { 1, 2 }), "first observation must initialize both self and low-priority player");
+        Assert(secondPlan.Snapshot.Players.Select(player => player.PlayerId).SequenceEqual(new[] { 1 }), "low-priority remote state should not be resent on every snapshot");
+        Assert(secondPlan.Snapshot.ReplicatedPlayerIds.SequenceEqual(new[] { 1, 2 }), "low-priority remote must remain in scope while its state is paced");
+        Assert(sixthTickPlan.Snapshot.Players.Select(player => player.PlayerId).SequenceEqual(new[] { 1, 2 }), "low-priority remote should be resent after its configured six-tick interval");
+    }
+
+    private static void FullSnapshotModePreservesTheChapterOneBaseline()
+    {
+        GameWorld world = CreateWorldWithThreePlayers();
+        SnapshotBuilder builder = new SnapshotBuilder();
+        ClientReplicator replicator = new ClientReplicator(new ClientReplicationSettings
+        {
+            EnableDistanceFiltering = false,
+            CombatPriorityDurationTicks = 0
+        });
+
+        ClientSnapshotPlan plan = replicator.BuildSnapshot(1, 1, 30, builder.Capture(world));
+
+        Assert(plan.Snapshot.Players.Select(player => player.PlayerId).SequenceEqual(new[] { 1, 2, 3 }), "full mode must send every player just like the chapter-one broadcast");
+        Assert(plan.Snapshot.ReplicatedPlayerIds.SequenceEqual(new[] { 1, 2, 3 }), "full mode must keep every player in scope");
+    }
+
+    private static void DistanceFilteringIsTheDefaultReplicationMode()
+    {
+        ClientReplicationSettings settings = new ClientReplicationSettings();
+        Assert(settings.EnableDistanceFiltering, "phase-11 settings should enable distance filtering unless full-snapshot mode is explicitly selected");
+    }
+
+    private static void InactiveClientsAreRemovedFromTheRegistry()
+    {
+        ClientRegistry registry = new ClientRegistry();
+        ClientReplicationSettings settings = new ClientReplicationSettings();
+        IPEndPoint endpoint = new IPEndPoint(IPAddress.Loopback, 9001);
+        ClientRegistration registration = registry.RegisterOrUpdate("TimeoutTest", endpoint, settings);
+
+        List<ConnectedClient> removed = registry.RemoveInactive(DateTime.UtcNow.AddSeconds(9), TimeSpan.FromSeconds(8));
+
+        Assert(removed.Count == 1 && removed[0].PlayerId == registration.Client.PlayerId, "silent client should be removed after the timeout window");
+        Assert(registry.Count == 0, "expired client must no longer remain in the registry");
+    }
+
+    private static GameWorld CreateWorldWithThreePlayers()
+    {
+        GameWorld world = CreateWorld();
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+        Assert(world.AddPlayer(3), "player 3 should be added");
+        return world;
     }
 
     private static GameWorld CreateWorld()

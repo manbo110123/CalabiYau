@@ -34,6 +34,8 @@ public class NetworkTankAvatar : MonoBehaviour
     private float pendingAimZ;
     private bool useRemoteInterpolation;
     private int interpolationDelayTicks = 3;
+    private int observedSnapshotIntervalTicks = 1;
+    private int lastReceivedRemoteSnapshotTick;
     private float interpolationTickRate = 30f;
     private int maxBufferedSnapshots = 8;
     private bool hasLocalPredictionCorrectionTarget;
@@ -56,6 +58,8 @@ public class NetworkTankAvatar : MonoBehaviour
     public bool IsAlive => isAlive;
     public float RespawnRemainingSeconds => respawnRemainingSeconds;
     public int RemoteSnapshotBufferCount => remoteSnapshotBuffer.Count;
+    public int EffectiveRemoteInterpolationDelayTicks => Mathf.Max(interpolationDelayTicks, observedSnapshotIntervalTicks + 1);
+    public bool HasLocalPredictionCorrection => hasLocalPredictionCorrectionTarget;
 
     private void Awake()
     {
@@ -149,7 +153,7 @@ public class NetworkTankAvatar : MonoBehaviour
         ApplyBodyStateDirectly(position, rotation);
     }
 
-    public void SmoothToPredictedServerState(
+    public bool SmoothToPredictedServerState(
         Vector3 position,
         Quaternion rotation,
         float correctionSpeed,
@@ -163,18 +167,30 @@ public class NetworkTankAvatar : MonoBehaviour
         localCorrectionSpeed = Mathf.Max(0.1f, correctionSpeed);
         localCorrectionMaxSeconds = Mathf.Max(0.01f, maxCorrectionSeconds);
         localCorrectionStopDistance = Mathf.Max(0.001f, stopDistance);
-        if (!hasLocalPredictionCorrectionTarget)
+        bool startedNewCorrection = !hasLocalPredictionCorrectionTarget;
+
+        if (startedNewCorrection)
         {
             localCorrectionStartedAt = Time.time;
         }
 
         hasLocalPredictionCorrectionTarget = true;
+        return startedNewCorrection;
+    }
+
+    // Used by the local prediction owner before its Rigidbody continues moving. Remote
+    // avatars never call this because their transform is driven by snapshot interpolation.
+    public void CancelLocalPredictionCorrection()
+    {
+        hasLocalPredictionCorrectionTarget = false;
     }
 
     public void SetRemoteInterpolation(bool isEnabled, int delayTicks, float tickRate, int maxSnapshots)
     {
         useRemoteInterpolation = isEnabled;
         interpolationDelayTicks = Mathf.Max(1, delayTicks);
+        observedSnapshotIntervalTicks = 1;
+        lastReceivedRemoteSnapshotTick = 0;
         interpolationTickRate = Mathf.Max(1f, tickRate);
         maxBufferedSnapshots = Mathf.Max(2, maxSnapshots);
 
@@ -186,6 +202,19 @@ public class NetworkTankAvatar : MonoBehaviour
 
     public void AddRemoteSnapshot(int serverTick, float x, float y, float z, float bodyYaw, float aimX, float aimZ)
     {
+        // Low-priority entities can be replicated at 5 Hz while the server still ticks at
+        // 30 Hz. Match the visual delay to the observed tick gap; otherwise a 3-tick buffer
+        // runs dry between 6-tick updates and the avatar alternates between holding and jumping.
+        if (lastReceivedRemoteSnapshotTick > 0 && serverTick > lastReceivedRemoteSnapshotTick)
+        {
+            observedSnapshotIntervalTicks = serverTick - lastReceivedRemoteSnapshotTick;
+        }
+
+        if (serverTick > lastReceivedRemoteSnapshotTick)
+        {
+            lastReceivedRemoteSnapshotTick = serverTick;
+        }
+
         BufferedServerState snapshot = new BufferedServerState
         {
             ServerTick = serverTick,
@@ -280,7 +309,7 @@ public class NetworkTankAvatar : MonoBehaviour
 
         BufferedServerState newestSnapshot = remoteSnapshotBuffer[remoteSnapshotBuffer.Count - 1];
         float ticksSinceNewestArrived = (Time.time - newestSnapshot.ReceivedTime) * interpolationTickRate;
-        float renderTick = newestSnapshot.ServerTick - interpolationDelayTicks + ticksSinceNewestArrived;
+        float renderTick = newestSnapshot.ServerTick - EffectiveRemoteInterpolationDelayTicks + ticksSinceNewestArrived;
 
         BufferedServerState olderSnapshot = remoteSnapshotBuffer[0];
         BufferedServerState newerSnapshot = remoteSnapshotBuffer[remoteSnapshotBuffer.Count - 1];

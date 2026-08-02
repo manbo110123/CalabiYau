@@ -9,7 +9,11 @@ public sealed class UdpGameServerOptions
     public int TickRate { get; set; } = 30;
     public bool LogReceivedNetworkMessages { get; set; }
     public bool LogCommandDecisions { get; set; }
+    // UDP has no disconnect signal. This bounds how long a silent client can keep an
+    // authoritative player and a remote avatar alive after a crash or closed game.
+    public float ClientTimeoutSeconds { get; set; } = 8f;
     public GameWorldSettings WorldSettings { get; set; } = new GameWorldSettings();
+    public ClientReplicationSettings ReplicationSettings { get; set; } = new ClientReplicationSettings();
 }
 
 // Owns transport, routing, and the fixed-rate loop. It never changes PlayerState directly.
@@ -23,6 +27,7 @@ public sealed class UdpGameServer : IDisposable
     private readonly SnapshotBuilder snapshotBuilder = new SnapshotBuilder();
     private long sentSnapshotCount;
     private long sentGameplayEventCount;
+    private float snapshotSendAccumulator;
 
     public UdpGameServer(UdpGameServerOptions options)
     {
@@ -35,6 +40,7 @@ public sealed class UdpGameServer : IDisposable
     {
         Console.WriteLine($"UDP server started on port {options.ListenPort}.");
         Console.WriteLine($"Server authority tick rate: {options.TickRate} Hz.");
+        Console.WriteLine($"Per-client snapshot rate: {GetSnapshotRate()} Hz, distance filtering: {options.ReplicationSettings.EnableDistanceFiltering}.");
         Console.WriteLine("Waiting for Unity ClientHello, PlayerInput and FireRequest messages...");
 
         Task receiveTask = ReceiveLoopAsync(cancellationToken);
@@ -65,6 +71,14 @@ public sealed class UdpGameServer : IDisposable
 
             string messageType = ReadMessageType(json);
 
+            if (messageType != "ClientHello")
+            {
+                lock (stateLock)
+                {
+                    clientRegistry.Touch(received.RemoteEndPoint, DateTime.UtcNow);
+                }
+            }
+
             switch (messageType)
             {
                 case "ClientHello":
@@ -77,6 +91,10 @@ public sealed class UdpGameServer : IDisposable
 
                 case "FireRequest":
                     await HandleFireRequestAsync(received.RemoteEndPoint, json);
+                    break;
+
+                case "ClientGoodbye":
+                    HandleClientGoodbye(received.RemoteEndPoint);
                     break;
 
                 case "":
@@ -97,25 +115,58 @@ public sealed class UdpGameServer : IDisposable
 
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
-            WorldSnapshotMessage snapshot;
+            List<SnapshotSendWork> snapshotSendWork = new List<SnapshotSendWork>();
             List<IPEndPoint> targets;
             List<GameWorldEvent> worldEvents;
 
             lock (stateLock)
             {
+                List<ConnectedClient> timedOutClients = clientRegistry.RemoveInactive(
+                    DateTime.UtcNow,
+                    TimeSpan.FromSeconds(Math.Max(1f, options.ClientTimeoutSeconds)));
+
+                foreach (ConnectedClient timedOutClient in timedOutClients)
+                {
+                    world.RemovePlayer(timedOutClient.PlayerId);
+                    Console.WriteLine($"Client timed out: playerId={timedOutClient.PlayerId}, name={timedOutClient.Name}.");
+                }
+
                 worldEvents = world.Tick(tickDeltaTime);
-                snapshot = snapshotBuilder.Build(world);
                 targets = clientRegistry.GetAllEndpoints();
+
+                snapshotSendAccumulator += tickDeltaTime;
+                float snapshotIntervalSeconds = 1f / GetSnapshotRate();
+
+                if (snapshotSendAccumulator >= snapshotIntervalSeconds)
+                {
+                    snapshotSendAccumulator -= snapshotIntervalSeconds;
+                    IReadOnlyList<ReplicationCandidate> candidates = snapshotBuilder.Capture(world);
+
+                    foreach (ConnectedClient client in clientRegistry.GetAllClients())
+                    {
+                        ClientSnapshotPlan plan = client.Replicator.BuildSnapshot(
+                            client.PlayerId,
+                            world.ServerTick,
+                            options.TickRate,
+                            candidates);
+                        snapshotSendWork.Add(new SnapshotSendWork(client, plan));
+                    }
+                }
             }
 
-            if (targets.Count > 0)
+            foreach (SnapshotSendWork work in snapshotSendWork)
             {
-                await BroadcastSnapshotAsync(snapshot, targets);
+                await SendSnapshotAsync(work);
             }
 
             foreach (GameWorldEvent worldEvent in worldEvents)
             {
                 await BroadcastGameplayEventAsync(CreateNetworkEvent(worldEvent), targets);
+            }
+
+            if (world.ServerTick % Math.Max(1, options.TickRate) == 0)
+            {
+                LogServerTelemetry();
             }
         }
     }
@@ -139,7 +190,7 @@ public sealed class UdpGameServer : IDisposable
 
         lock (stateLock)
         {
-            registration = clientRegistry.RegisterOrUpdate(playerName, remoteEndPoint);
+            registration = clientRegistry.RegisterOrUpdate(playerName, remoteEndPoint, options.ReplicationSettings);
 
             if (registration.IsNewClient)
             {
@@ -290,29 +341,56 @@ public sealed class UdpGameServer : IDisposable
         }
     }
 
-    private async Task BroadcastSnapshotAsync(WorldSnapshotMessage snapshot, List<IPEndPoint> targets)
+    private async Task SendSnapshotAsync(SnapshotSendWork work)
     {
-        string json = JsonSerializer.Serialize(snapshot);
+        string json = JsonSerializer.Serialize(work.Plan.Snapshot);
         byte[] bytes = Encoding.UTF8.GetBytes(json);
-
-        foreach (IPEndPoint target in targets)
-        {
-            await udpServer.SendAsync(bytes, bytes.Length, target);
-        }
-
+        await udpServer.SendAsync(bytes, bytes.Length, work.Client.RemoteEndPoint);
+        work.Client.Replicator.RecordSentSnapshot(bytes.Length, work.Plan);
         sentSnapshotCount++;
+    }
 
-        if (world.ServerTick % options.TickRate == 0)
+    private void HandleClientGoodbye(IPEndPoint remoteEndPoint)
+    {
+        lock (stateLock)
         {
-            Console.WriteLine(
-                $"Tick={world.ServerTick}, players={snapshot.Players.Length}, " +
-                $"input={world.AcceptedInputCount}/{world.ReceivedInputCount}, inputRejected={world.RejectedInputCount}, " +
-                $"inputSuperseded={world.SupersededInputCount}, inputReasons=[{world.GetInputRejectionSummary()}], " +
-                $"snapshots={sentSnapshotCount}, fire={world.AcceptedFireRequestCount}/{world.ReceivedFireRequestCount}, " +
-                $"fireRejected={world.RejectedFireRequestCount}, fireReasons=[{world.GetFireRejectionSummary()}], " +
-                $"events={sentGameplayEventCount}, lagCompFire={world.LagCompensatedFireRequestCount}, " +
-                $"deaths={world.DeathCount}, respawns={world.RespawnCount}");
+            if (!clientRegistry.TryRemove(remoteEndPoint, out ConnectedClient? client) || client == null)
+            {
+                Console.WriteLine("ClientGoodbye ignored: sender is not registered.");
+                return;
+            }
+
+            world.RemovePlayer(client.PlayerId);
+            Console.WriteLine($"Client disconnected: playerId={client.PlayerId}, name={client.Name}.");
         }
+    }
+
+    private void LogServerTelemetry()
+    {
+        Console.WriteLine(
+            $"Tick={world.ServerTick}, players={world.Players.Count}, " +
+            $"input={world.AcceptedInputCount}/{world.ReceivedInputCount}, inputRejected={world.RejectedInputCount}, " +
+            $"inputSuperseded={world.SupersededInputCount}, inputReasons=[{world.GetInputRejectionSummary()}], " +
+            $"snapshotDatagrams={sentSnapshotCount}, snapshotRate={GetSnapshotRate()}Hz, " +
+            $"distanceFiltering={options.ReplicationSettings.EnableDistanceFiltering}, " +
+            $"fire={world.AcceptedFireRequestCount}/{world.ReceivedFireRequestCount}, " +
+            $"fireRejected={world.RejectedFireRequestCount}, fireReasons=[{world.GetFireRejectionSummary()}], " +
+            $"events={sentGameplayEventCount}, lagCompFire={world.LagCompensatedFireRequestCount}, " +
+            $"deaths={world.DeathCount}, respawns={world.RespawnCount}");
+
+        foreach (ConnectedClient client in clientRegistry.GetAllClients().OrderBy(client => client.PlayerId))
+        {
+            ClientReplicationTelemetry telemetry = client.Replicator.ConsumeTelemetry();
+            Console.WriteLine(
+                $"Replication client={client.PlayerId}, snapshots={telemetry.SnapshotCount}/s, " +
+                $"statePlayers={telemetry.LastPlayerCount}, scopePlayers={telemetry.LastScopedPlayerCount}, " +
+                $"bytes={telemetry.ByteCount}/s.");
+        }
+    }
+
+    private int GetSnapshotRate()
+    {
+        return Math.Clamp(options.ReplicationSettings.SnapshotRate, 1, Math.Max(1, options.TickRate));
     }
 
     private async Task BroadcastGameplayEventAsync(object message, List<IPEndPoint> targets)
@@ -409,5 +487,17 @@ public sealed class UdpGameServer : IDisposable
             default:
                 throw new InvalidOperationException($"Unsupported world event '{worldEvent.GetType().Name}'.");
         }
+    }
+
+    private readonly struct SnapshotSendWork
+    {
+        public SnapshotSendWork(ConnectedClient client, ClientSnapshotPlan plan)
+        {
+            Client = client;
+            Plan = plan;
+        }
+
+        public ConnectedClient Client { get; }
+        public ClientSnapshotPlan Plan { get; }
     }
 }
