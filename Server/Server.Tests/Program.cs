@@ -5,11 +5,14 @@ internal static class Program
     private static void Main()
     {
         DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward();
+        InputLeaseStopsMovementAfterCommandsExpire();
         InvalidAndFutureInputsAreRejectedAtTheWorldGate();
+        FireCommandsResolveOnlyInsideTheServerTick();
         DeadPlayersCannotQueueInputsOrFireRequests();
         PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers();
         LowPriorityEntitiesKeepTheirScopeButUseALowerStateRate();
         FullSnapshotModePreservesTheChapterOneBaseline();
+        SnapshotSequenceIsIndependentFromServerTick();
         DistanceFilteringIsTheDefaultReplicationMode();
         InactiveClientsAreRemovedFromTheRegistry();
 
@@ -42,7 +45,7 @@ internal static class Program
         Assert(world.AddPlayer(1), "player 1 should be added");
 
         AssertRejected(world.TryQueueInput(1, Input(1, 2f)), "out-of-range movement axis");
-        AssertRejected(world.TryQueueInput(1, new InputCommand(1, 0f, 0f, float.NaN, 5f, false)), "NaN aim value");
+        AssertRejected(world.TryQueueInput(1, new InputCommand(1, 0f, 0f, float.NaN, 5f)), "NaN aim value");
         AssertRejected(world.TryQueueInput(1, Input(31, 0f)), "input outside the future window");
         Assert(world.RejectedInputCount == 3, "all invalid inputs must be counted");
         Assert(world.InputRejectionsByReason.ContainsKey("movement-axis-out-of-range"), "axis rejection reason should be observable");
@@ -61,15 +64,44 @@ internal static class Program
         Assert(world.AddPlayer(1), "player 1 should be added");
         Assert(world.AddPlayer(2), "player 2 should be added");
 
-        bool shotAccepted = world.TryHandleFireRequest(1, Fire(1, 4f, 0f, 1f, 0f, 0f), out _, out string shotRejectReason);
-        Assert(shotAccepted, $"killing shot should be accepted: {shotRejectReason}");
+        AssertAccepted(world.TryQueueFire(1, Fire(1, 1, 4f, 0f)), "killing fire request");
+        world.Tick(1f / 30f);
         PlayerState playerTwo = world.Players.Single(player => player.PlayerId == 2);
         Assert(!playerTwo.IsAlive, "player 2 should be dead after the authoritative hit");
 
         AssertRejected(world.TryQueueInput(2, Input(1, 1f)), "input from a dead player");
-        bool deadFireAccepted = world.TryHandleFireRequest(2, Fire(1, 0f, 0f, -1f, 0f, 0f), out _, out string deadFireRejectReason);
-        Assert(!deadFireAccepted && deadFireRejectReason.Contains("dead"), "fire request from a dead player must be rejected");
+        AssertRejected(world.TryQueueFire(2, Fire(1, 1, 0f, 0f)), "fire request from a dead player");
         Assert(world.FireRejectionsByReason.ContainsKey("player-dead"), "dead fire rejection should be observable");
+    }
+
+    private static void InputLeaseStopsMovementAfterCommandsExpire()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings { InputHoldTimeoutTicks = 2 });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        AssertAccepted(world.TryQueueInput(1, Input(1, 1f)), "initial movement input");
+
+        world.Tick(1f / 30f);
+        world.Tick(1f / 30f);
+        world.Tick(1f / 30f);
+        float positionBeforeExpiry = world.Players.Single().Z;
+
+        world.Tick(1f / 30f);
+        Assert(world.Players.Single().Z == positionBeforeExpiry, "movement must stop when the input lease expires");
+    }
+
+    private static void FireCommandsResolveOnlyInsideTheServerTick()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings { FireCooldownSeconds = 0f, AimToleranceMeters = 50f });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+
+        AssertAccepted(world.TryQueueFire(1, Fire(1, 1, 4f, 0f)), "first fire command");
+        AssertRejected(world.TryQueueFire(1, Fire(1, 1, 4f, 0f)), "duplicate fire sequence");
+        Assert(world.Players.Single(player => player.PlayerId == 2).Health == world.MaxHealth, "queued fire must not damage before Tick");
+
+        List<GameWorldEvent> events = world.Tick(1f / 30f);
+        Assert(events.OfType<FireResolvedEvent>().Any(), "Tick should resolve the queued fire command");
+        Assert(world.Players.Single(player => player.PlayerId == 2).Health < world.MaxHealth, "resolved fire should apply authoritative damage");
     }
 
     private static void PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers()
@@ -150,6 +182,19 @@ internal static class Program
         Assert(registry.Count == 0, "expired client must no longer remain in the registry");
     }
 
+    private static void SnapshotSequenceIsIndependentFromServerTick()
+    {
+        GameWorld world = CreateWorldWithThreePlayers();
+        SnapshotBuilder builder = new SnapshotBuilder();
+        ClientReplicator replicator = new ClientReplicator(new ClientReplicationSettings());
+
+        ClientSnapshotPlan firstPlan = replicator.BuildSnapshot(1, 30, 30, builder.Capture(world));
+        ClientSnapshotPlan secondPlan = replicator.BuildSnapshot(1, 30, 30, builder.Capture(world));
+
+        Assert(firstPlan.Snapshot.SnapshotSequence == 1, "first snapshot sequence should start at one");
+        Assert(secondPlan.Snapshot.SnapshotSequence == 2, "every datagram needs its own sequence even at the same simulation Tick");
+    }
+
     private static GameWorld CreateWorldWithThreePlayers()
     {
         GameWorld world = CreateWorld();
@@ -171,21 +216,16 @@ internal static class Program
 
     private static InputCommand Input(int inputTick, float moveAxis)
     {
-        return new InputCommand(inputTick, moveAxis, 0f, 0f, 5f, false);
+        return new InputCommand(inputTick, moveAxis, 0f, 0f, 5f);
     }
 
-    private static FireCommand Fire(int requestTick, float aimX, float aimZ, float directionX, float directionY, float directionZ)
+    private static FireCommand Fire(int fireSequence, int requestTick, float aimX, float aimZ)
     {
         return new FireCommand(
+            fireSequence,
             requestTick,
             aimX,
             aimZ,
-            0f,
-            1.2f,
-            0f,
-            directionX,
-            directionY,
-            directionZ,
             0.1f,
             0.1f);
     }

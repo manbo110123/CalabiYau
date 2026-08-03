@@ -76,9 +76,11 @@ public class UdpNetworkClient : MonoBehaviour
     private float lastPredictionCorrectionDistance;
     private float lastLocalMovementInputTime = float.NegativeInfinity;
     private int sentFireRequestCount;
+    private int nextFireSequence = 1;
     private int receivedGameplayEventCount;
     private bool isLocalAlive = true;
     private int lastReceivedSnapshotTick;
+    private uint lastReceivedSnapshotSequence;
     private int lastAppliedWorldSnapshotTick;
     private float lastSnapshotReceivedTime;
     private int receivedSnapshotCount;
@@ -310,8 +312,6 @@ public class UdpNetworkClient : MonoBehaviour
         message.turnAxis = inputData.TurnAxis;
         message.aimX = aimPoint.x;
         message.aimZ = aimPoint.z;
-        message.fire = inputData.FirePressed;
-
         SaveLocalInput(message);
         SendJson(JsonUtility.ToJson(message));
     }
@@ -336,21 +336,13 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         Vector3 aimPoint = localTank.CurrentAimPoint;
-        Vector3 fireOrigin = localTank.CurrentFireOrigin;
-        Vector3 fireDirection = localTank.CurrentFireDirection.normalized;
-
         FireRequestMessage message = new FireRequestMessage();
         message.type = "FireRequest";
         message.playerId = playerId;
+        message.fireSequence = nextFireSequence++;
         message.requestTick = inputTick;
         message.aimX = aimPoint.x;
         message.aimZ = aimPoint.z;
-        message.originX = fireOrigin.x;
-        message.originY = fireOrigin.y;
-        message.originZ = fireOrigin.z;
-        message.directionX = fireDirection.x;
-        message.directionY = fireDirection.y;
-        message.directionZ = fireDirection.z;
         message.estimatedRttSeconds = GetDisplayedRttSeconds();
         message.interpolationDelaySeconds = remoteInterpolationDelaySeconds;
 
@@ -367,7 +359,6 @@ public class UdpNetworkClient : MonoBehaviour
             TurnAxis = message.turnAxis,
             AimX = message.aimX,
             AimZ = message.aimZ,
-            Fire = message.fire,
             SentTime = Time.time
         };
 
@@ -450,7 +441,7 @@ public class UdpNetworkClient : MonoBehaviour
                         continue;
                     }
 
-                    RecordSnapshotStats(snapshot.serverTick);
+                    RecordSnapshotStats(snapshot.serverTick, snapshot.snapshotSequence);
 
                     if (snapshot.serverTick <= lastAppliedWorldSnapshotTick)
                     {
@@ -526,6 +517,7 @@ public class UdpNetworkClient : MonoBehaviour
     {
         ServerWelcomeMessage welcome = JsonUtility.FromJson<ServerWelcomeMessage>(json);
         playerId = welcome.playerId;
+        nextFireSequence = 1;
         isLocalAlive = true;
         ResetLocalPredictionState();
         ResetNetworkDebugStats();
@@ -548,7 +540,7 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
-        RecordSnapshotStats(snapshot.serverTick);
+        RecordSnapshotStats(snapshot.serverTick, snapshot.snapshotSequence);
         ApplyWorldSnapshot(snapshot);
     }
 
@@ -849,6 +841,7 @@ public class UdpNetworkClient : MonoBehaviour
     private void ResetNetworkDebugStats()
     {
         lastReceivedSnapshotTick = 0;
+        lastReceivedSnapshotSequence = 0;
         lastAppliedWorldSnapshotTick = 0;
         lastSnapshotReceivedTime = 0f;
         receivedSnapshotCount = 0;
@@ -867,24 +860,36 @@ public class UdpNetworkClient : MonoBehaviour
         receivedGameplayEventCount = 0;
     }
 
-    private void RecordSnapshotStats(int serverTick)
+    private void RecordSnapshotStats(int serverTick, uint snapshotSequence)
     {
-        if (serverTick <= 0)
+        if (serverTick <= 0 || snapshotSequence == 0)
         {
             return;
         }
 
-        if (lastReceivedSnapshotTick > 0 && serverTick > lastReceivedSnapshotTick + 1)
+        if (lastReceivedSnapshotSequence != 0
+            && IsSequenceNewer(snapshotSequence, lastReceivedSnapshotSequence))
         {
-            estimatedMissedSnapshotCount += serverTick - lastReceivedSnapshotTick - 1;
+            uint gap = snapshotSequence - lastReceivedSnapshotSequence;
+
+            if (gap > 1)
+            {
+                estimatedMissedSnapshotCount += (int)(gap - 1);
+            }
         }
 
-        if (serverTick > lastReceivedSnapshotTick)
+        if (lastReceivedSnapshotSequence == 0 || IsSequenceNewer(snapshotSequence, lastReceivedSnapshotSequence))
         {
-            lastReceivedSnapshotTick = serverTick;
+            lastReceivedSnapshotSequence = snapshotSequence;
+            lastReceivedSnapshotTick = Mathf.Max(lastReceivedSnapshotTick, serverTick);
             lastSnapshotReceivedTime = Time.time;
             receivedSnapshotCount++;
         }
+    }
+
+    private static bool IsSequenceNewer(uint candidate, uint reference)
+    {
+        return candidate != reference && candidate - reference < 0x80000000u;
     }
 
     private void UpdateRttFromAcknowledgedInput(int acknowledgedInputTick)
@@ -1141,7 +1146,6 @@ public class UdpNetworkClient : MonoBehaviour
             TurnAxis = currentInput.TurnAxis,
             AimX = currentAimPoint.x,
             AimZ = currentAimPoint.z,
-            Fire = currentInput.FirePressed,
             SentTime = Time.time
         };
 
@@ -1655,7 +1659,6 @@ public class PlayerInputMessage
     public float turnAxis;
     public float aimX;
     public float aimZ;
-    public bool fire;
 }
 
 [Serializable]
@@ -1663,15 +1666,10 @@ public class FireRequestMessage
 {
     public string type;
     public int playerId;
+    public int fireSequence;
     public int requestTick;
     public float aimX;
     public float aimZ;
-    public float originX;
-    public float originY;
-    public float originZ;
-    public float directionX;
-    public float directionY;
-    public float directionZ;
     public float estimatedRttSeconds;
     public float interpolationDelaySeconds;
 }
@@ -1681,6 +1679,7 @@ public class WorldSnapshotMessage
 {
     public string type;
     public int serverTick;
+    public uint snapshotSequence;
     public PlayerSnapshotMessage[] players;
     public int[] replicatedPlayerIds;
     public bool isFullState;
@@ -1761,7 +1760,6 @@ public struct BufferedLocalInput
     public float TurnAxis;
     public float AimX;
     public float AimZ;
-    public bool Fire;
     public float SentTime;
 }
 

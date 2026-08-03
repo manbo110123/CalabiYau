@@ -17,8 +17,6 @@ public sealed class ClientReplicationSettings
     // A player which has just fired or been hit stays high priority briefly, even at range.
     public int CombatPriorityDurationTicks { get; set; } = 30;
 
-    // A true delta requires an acknowledged baseline. Keep full state enabled until phase 13.
-    public bool UseFullStateFallback { get; set; } = true;
 }
 
 public sealed class ReplicationCandidate
@@ -56,6 +54,7 @@ public sealed class ClientReplicator
     private readonly ClientReplicationSettings settings;
     private readonly Dictionary<int, int> lastSentTickByPlayerId = new Dictionary<int, int>();
     private int sentSnapshotCountSinceTelemetry;
+    private uint nextSnapshotSequence;
     private long sentBytesSinceTelemetry;
     private int lastSentPlayerCount;
     private int lastScopedPlayerCount;
@@ -131,9 +130,12 @@ public sealed class ClientReplicator
             {
                 Type = "WorldSnapshot",
                 ServerTick = serverTick,
+                SnapshotSequence = ++nextSnapshotSequence,
                 Players = statesToSend.ToArray(),
                 ReplicatedPlayerIds = scopedPlayerIds.ToArray(),
-                IsFullState = settings.UseFullStateFallback
+                // Delta snapshots need a client-acknowledged baseline. Until that protocol
+                // exists, every emitted state entry is explicitly a full authoritative state.
+                IsFullState = true
             },
             ScopedPlayerCount = scopedPlayerIds.Count,
             HighPriorityPlayerCount = highPriorityCount,

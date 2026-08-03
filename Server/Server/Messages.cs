@@ -44,8 +44,6 @@ public sealed class PlayerInputMessage
     [JsonPropertyName("aimZ")]
     public float AimZ { get; set; }
 
-    [JsonPropertyName("fire")]
-    public bool Fire { get; set; }
 }
 
 public sealed class FireRequestMessage
@@ -56,6 +54,9 @@ public sealed class FireRequestMessage
     [JsonPropertyName("playerId")]
     public int PlayerId { get; set; }
 
+    [JsonPropertyName("fireSequence")]
+    public int FireSequence { get; set; }
+
     [JsonPropertyName("requestTick")]
     public int RequestTick { get; set; }
 
@@ -64,24 +65,6 @@ public sealed class FireRequestMessage
 
     [JsonPropertyName("aimZ")]
     public float AimZ { get; set; }
-
-    [JsonPropertyName("originX")]
-    public float OriginX { get; set; }
-
-    [JsonPropertyName("originY")]
-    public float OriginY { get; set; }
-
-    [JsonPropertyName("originZ")]
-    public float OriginZ { get; set; }
-
-    [JsonPropertyName("directionX")]
-    public float DirectionX { get; set; }
-
-    [JsonPropertyName("directionY")]
-    public float DirectionY { get; set; }
-
-    [JsonPropertyName("directionZ")]
-    public float DirectionZ { get; set; }
 
     [JsonPropertyName("estimatedRttSeconds")]
     public float EstimatedRttSeconds { get; set; }
@@ -97,6 +80,10 @@ public sealed class WorldSnapshotMessage
 
     [JsonPropertyName("serverTick")]
     public int ServerTick { get; set; }
+
+    // A per-client datagram sequence is intentionally separate from simulation Tick.
+    [JsonPropertyName("snapshotSequence")]
+    public uint SnapshotSequence { get; set; }
 
     [JsonPropertyName("players")]
     public PlayerSnapshotMessage[] Players { get; set; } = Array.Empty<PlayerSnapshotMessage>();

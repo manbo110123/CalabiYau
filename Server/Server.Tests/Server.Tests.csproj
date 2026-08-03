@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\Server\GameWorld.cs" Link="GameWorld.cs" />
+    <Compile Include="..\Server\Messages.cs" Link="Messages.cs" />
+    <Compile Include="..\Server\SnapshotBuilder.cs" Link="SnapshotBuilder.cs" />
+    <Compile Include="..\Server\ClientReplicator.cs" Link="ClientReplicator.cs" />
+    <Compile Include="..\Server\ClientRegistry.cs" Link="ClientRegistry.cs" />
+  </ItemGroup>
+
+</Project>

@@ -43,6 +43,14 @@ ExportedObj/
 *.opendb
 *.VC.db
 
+# The .NET authoritative server is source code, not Unity-generated project metadata.
+!/Server/**/*.csproj
+!/Server/**/*.slnx
+
+# Server build artifacts can appear below the Unity project root as well.
+**/[Bb]in/
+**/[Oo]bj/
+
 # Unity3D generated meta files
 *.pidb.meta
 *.pdb.meta

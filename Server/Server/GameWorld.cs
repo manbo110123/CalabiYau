@@ -10,7 +10,6 @@ public sealed class GameWorldSettings
     public float FireRange { get; set; } = 35f;
     public float HitRadius { get; set; } = 1.2f;
     public float AimToleranceMeters { get; set; } = 3f;
-    public float MinimumHorizontalFireDirectionLength { get; set; } = 0.25f;
     public float MuzzleForwardOffsetMeters { get; set; } = 1.4f;
     public float MuzzleHeightMeters { get; set; } = 1.2f;
     public bool EnableLagCompensation { get; set; } = true;
@@ -20,6 +19,11 @@ public sealed class GameWorldSettings
     // At 30 Hz this keeps about two seconds of commands. It absorbs a short burst of UDP
     // reordering without making the server retain an unbounded client-controlled queue.
     public int InputBufferCapacity { get; set; } = 64;
+
+    // A latest-input simulation needs an expiry. Without this lease, a lost key-up packet
+    // could make a player keep moving forever on the authoritative server.
+    public int InputHoldTimeoutTicks { get; set; } = 6;
+    public int FireBufferCapacity { get; set; } = 16;
 
     // A client may be up to one second ahead of the latest consumed input. Larger windows
     // tolerate jitter, but also retain more stale intent when the client has fallen behind.
@@ -58,6 +62,7 @@ public sealed class GameWorld
     public long RejectedInputCount { get; private set; }
     public long SupersededInputCount { get; private set; }
     public long ReceivedFireRequestCount { get; private set; }
+    public long QueuedFireRequestCount { get; private set; }
     public long AcceptedFireRequestCount { get; private set; }
     public long RejectedFireRequestCount { get; private set; }
     public long DeathCount { get; private set; }
@@ -168,133 +173,51 @@ public sealed class GameWorld
         return FormatRejectionSummary(fireRejectionsByReason);
     }
 
-    public bool TryHandleFireRequest(
-        int playerId,
-        FireCommand command,
-        out List<GameWorldEvent> eventsToBroadcast,
-        out string rejectReason)
+    // Fire is a discrete command. Reception only validates and queues it; the fixed Tick
+    // resolves cooldown, hit detection, damage, and events together with all other rules.
+    public CommandGateResult TryQueueFire(int playerId, FireCommand command)
     {
-        eventsToBroadcast = new List<GameWorldEvent>();
-        rejectReason = string.Empty;
         ReceivedFireRequestCount++;
 
         if (!playersById.TryGetValue(playerId, out PlayerState? shooter))
         {
-            rejectReason = $"unknown shooter playerId={playerId}";
             return RejectFire("unknown-player");
-        }
-
-        if (!IsValidFireCommand(command, shooter, out rejectReason))
-        {
-            return RejectFire("invalid-fire-command");
         }
 
         if (!shooter.IsAlive)
         {
-            rejectReason = $"playerId={playerId} is dead and waiting to respawn";
             return RejectFire("player-dead");
+        }
+
+        if (!IsValidFireCommand(command, shooter, out string rejectReason))
+        {
+            return RejectFire("invalid-fire-command");
         }
 
         if (command.RequestTick < shooter.LastProcessedInputTick - settings.MaxInputTickLag)
         {
-            rejectReason = $"requestTick={command.RequestTick} is older than accepted input window";
             return RejectFire("request-too-old");
         }
 
         if (command.RequestTick > shooter.LastProcessedInputTick + settings.MaxInputTickAhead)
         {
-            rejectReason = $"requestTick={command.RequestTick} is too far ahead of lastProcessedInputTick={shooter.LastProcessedInputTick}";
             return RejectFire("request-too-far-in-future");
         }
 
-        if (command.RequestTick <= shooter.LastHandledFireRequestTick)
+        if (command.FireSequence <= shooter.LastQueuedFireSequence)
         {
-            rejectReason = $"requestTick={command.RequestTick} is duplicate or out of order; lastHandled={shooter.LastHandledFireRequestTick}";
-            return RejectFire("duplicate-or-out-of-order-request");
+            return RejectFire("duplicate-or-out-of-order-fire");
         }
 
-        // A fire intent is single-use even when it is rejected by cooldown. A delayed UDP
-        // duplicate must not become a valid shot after the cooldown has elapsed.
-        shooter.LastHandledFireRequestTick = command.RequestTick;
-
-        if (ServerTick < shooter.NextAllowedFireServerTick)
+        if (shooter.PendingFires.Count >= settings.FireBufferCapacity)
         {
-            rejectReason = $"cooldown is not ready until serverTick={shooter.NextAllowedFireServerTick}";
-            return RejectFire("cooldown");
+            return RejectFire("fire-buffer-full");
         }
 
-        LagCompensationFrame shooterFrame = BuildLagCompensationFrame(shooter, command);
-
-        if (!IsRequestedAimReasonable(shooter.AimX, shooter.AimZ, command)
-            && !IsRequestedAimReasonable(shooterFrame.AimX, shooterFrame.AimZ, command))
-        {
-            rejectReason = "requested aim is too far from the current and lag-compensated server-known aim";
-            return RejectFire("aim-mismatch");
-        }
-
-        if (!IsRequestedFireDirectionReasonable(command, out rejectReason))
-        {
-            return RejectFire("invalid-fire-direction");
-        }
-
-        AcceptedFireRequestCount++;
-        shooter.LastCombatServerTick = ServerTick;
-        shooter.NextAllowedFireServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(settings.FireCooldownSeconds * settings.ServerTickRate));
-
-        if (shooterFrame.RewindTicks > 0)
-        {
-            LagCompensatedFireRequestCount++;
-        }
-
-        FireRay fireRay = BuildFireRay(shooterFrame.X, shooterFrame.Z, shooterFrame.BodyYaw, command);
-        int hitPlayerId = FindFirstHitPlayer(shooter.PlayerId, fireRay, shooterFrame.HitTestServerTick, out float hitDistance);
-
-        eventsToBroadcast.Add(new FireResolvedEvent
-        {
-            ServerTick = ServerTick,
-            ShooterPlayerId = shooter.PlayerId,
-            RequestTick = command.RequestTick,
-            OriginX = fireRay.OriginX,
-            OriginY = fireRay.OriginY,
-            OriginZ = fireRay.OriginZ,
-            DirectionX = fireRay.DirectionX,
-            DirectionY = 0f,
-            DirectionZ = fireRay.DirectionZ,
-            Range = settings.FireRange,
-            LagCompensated = shooterFrame.RewindTicks > 0,
-            HitTestServerTick = shooterFrame.HitTestServerTick,
-            RewindSeconds = shooterFrame.RewindSeconds
-        });
-
-        if (hitPlayerId != 0 && playersById.TryGetValue(hitPlayerId, out PlayerState? hitPlayer))
-        {
-            hitPlayer.LastCombatServerTick = ServerTick;
-            int oldHealth = hitPlayer.Health;
-            hitPlayer.Health = Math.Max(0, hitPlayer.Health - settings.FireDamage);
-
-            if (hitPlayer.IsAlive && hitPlayer.Health <= 0)
-            {
-                KillPlayer(hitPlayer);
-            }
-
-            float hitX = fireRay.OriginX + fireRay.DirectionX * hitDistance;
-            float hitZ = fireRay.OriginZ + fireRay.DirectionZ * hitDistance;
-
-            eventsToBroadcast.Add(new HitResolvedEvent
-            {
-                ServerTick = ServerTick,
-                ShooterPlayerId = shooter.PlayerId,
-                TargetPlayerId = hitPlayer.PlayerId,
-                HitX = hitX,
-                HitY = fireRay.OriginY,
-                HitZ = hitZ,
-                Damage = oldHealth - hitPlayer.Health
-            });
-
-            eventsToBroadcast.Add(CreateHealthChangedEvent(hitPlayer));
-        }
-
-        return true;
+        shooter.PendingFires.Add(command.FireSequence, command);
+        shooter.LastQueuedFireSequence = command.FireSequence;
+        QueuedFireRequestCount++;
+        return CommandGateResult.Accepted("queued");
     }
 
     public List<GameWorldEvent> Tick(float deltaTime)
@@ -316,7 +239,105 @@ public sealed class GameWorld
             StorePlayerHistory(player);
         }
 
+        foreach (PlayerState player in playersById.Values)
+        {
+            ResolveQueuedFireRequests(player, eventsToBroadcast);
+        }
+
         return eventsToBroadcast;
+    }
+
+    private void ResolveQueuedFireRequests(PlayerState shooter, List<GameWorldEvent> eventsToBroadcast)
+    {
+        if (shooter.PendingFires.Count == 0)
+        {
+            return;
+        }
+
+        foreach (FireCommand command in shooter.PendingFires.Values)
+        {
+            shooter.LastProcessedFireSequence = command.FireSequence;
+
+            if (!shooter.IsAlive)
+            {
+                RejectFire("player-dead");
+                continue;
+            }
+
+            if (ServerTick < shooter.NextAllowedFireServerTick)
+            {
+                RejectFire("cooldown");
+                continue;
+            }
+
+            LagCompensationFrame shooterFrame = BuildLagCompensationFrame(shooter, command);
+
+            if (!IsRequestedAimReasonable(shooter.AimX, shooter.AimZ, command)
+                && !IsRequestedAimReasonable(shooterFrame.AimX, shooterFrame.AimZ, command))
+            {
+                RejectFire("aim-mismatch");
+                continue;
+            }
+
+            AcceptedFireRequestCount++;
+            shooter.LastCombatServerTick = ServerTick;
+            shooter.NextAllowedFireServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(settings.FireCooldownSeconds * settings.ServerTickRate));
+
+            if (shooterFrame.RewindTicks > 0)
+            {
+                LagCompensatedFireRequestCount++;
+            }
+
+            FireRay fireRay = BuildFireRay(shooterFrame.X, shooterFrame.Z, shooterFrame.BodyYaw, command);
+            int hitPlayerId = FindFirstHitPlayer(shooter.PlayerId, fireRay, shooterFrame.HitTestServerTick, out float hitDistance);
+
+            eventsToBroadcast.Add(new FireResolvedEvent
+            {
+                ServerTick = ServerTick,
+                ShooterPlayerId = shooter.PlayerId,
+                RequestTick = command.RequestTick,
+                OriginX = fireRay.OriginX,
+                OriginY = fireRay.OriginY,
+                OriginZ = fireRay.OriginZ,
+                DirectionX = fireRay.DirectionX,
+                DirectionY = 0f,
+                DirectionZ = fireRay.DirectionZ,
+                Range = settings.FireRange,
+                LagCompensated = shooterFrame.RewindTicks > 0,
+                HitTestServerTick = shooterFrame.HitTestServerTick,
+                RewindSeconds = shooterFrame.RewindSeconds
+            });
+
+            if (hitPlayerId != 0 && playersById.TryGetValue(hitPlayerId, out PlayerState? hitPlayer))
+            {
+                hitPlayer.LastCombatServerTick = ServerTick;
+                int oldHealth = hitPlayer.Health;
+                hitPlayer.Health = Math.Max(0, hitPlayer.Health - settings.FireDamage);
+
+                if (hitPlayer.IsAlive && hitPlayer.Health <= 0)
+                {
+                    KillPlayer(hitPlayer);
+                }
+
+                float hitX = fireRay.OriginX + fireRay.DirectionX * hitDistance;
+                float hitZ = fireRay.OriginZ + fireRay.DirectionZ * hitDistance;
+
+                eventsToBroadcast.Add(new HitResolvedEvent
+                {
+                    ServerTick = ServerTick,
+                    ShooterPlayerId = shooter.PlayerId,
+                    TargetPlayerId = hitPlayer.PlayerId,
+                    HitX = hitX,
+                    HitY = fireRay.OriginY,
+                    HitZ = hitZ,
+                    Damage = oldHealth - hitPlayer.Health
+                });
+
+                eventsToBroadcast.Add(CreateHealthChangedEvent(hitPlayer));
+            }
+        }
+
+        shooter.PendingFires.Clear();
     }
 
     public float GetRespawnRemainingSeconds(PlayerState player)
@@ -347,7 +368,7 @@ public sealed class GameWorld
             IsAlive = true,
             NextAllowedFireServerTick = 0,
             RespawnServerTick = 0,
-            LatestInput = new InputCommand(0, 0f, 0f, spawnX, 5f, false)
+            LatestInput = new InputCommand(0, 0f, 0f, spawnX, 5f)
         };
 
         StorePlayerHistory(player);
@@ -388,9 +409,9 @@ public sealed class GameWorld
             0f,
             0f,
             player.LatestInput.AimX,
-            player.LatestInput.AimZ,
-            false);
+            player.LatestInput.AimZ);
         player.PendingInputs.Clear();
+        player.PendingFires.Clear();
         DeathCount++;
     }
 
@@ -412,8 +433,9 @@ public sealed class GameWorld
         player.IsAlive = true;
         player.RespawnServerTick = 0;
         player.NextAllowedFireServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(0.25f * settings.ServerTickRate));
-        player.LatestInput = new InputCommand(player.LatestInput.InputTick, 0f, 0f, spawnX, 5f, false);
+        player.LatestInput = new InputCommand(player.LatestInput.InputTick, 0f, 0f, spawnX, 5f);
         player.PendingInputs.Clear();
+        player.PendingFires.Clear();
         RespawnCount++;
 
         return CreateHealthChangedEvent(player);
@@ -426,6 +448,16 @@ public sealed class GameWorld
     {
         if (player.PendingInputs.Count == 0)
         {
+            if (ServerTick - player.LastConsumedInputServerTick > settings.InputHoldTimeoutTicks)
+            {
+                player.LatestInput = new InputCommand(
+                    player.LatestInput.InputTick,
+                    0f,
+                    0f,
+                    player.LatestInput.AimX,
+                    player.LatestInput.AimZ);
+            }
+
             return;
         }
 
@@ -434,6 +466,7 @@ public sealed class GameWorld
         player.PendingInputs.Clear();
         player.LatestInput = newestInput.Value;
         player.LastProcessedInputTick = newestInput.Key;
+        player.LastConsumedInputServerTick = ServerTick;
         SupersededInputCount += discardedInputCount;
     }
 
@@ -526,6 +559,12 @@ public sealed class GameWorld
 
     private bool IsValidFireCommand(FireCommand command, PlayerState shooter, out string rejectReason)
     {
+        if (command.FireSequence <= 0)
+        {
+            rejectReason = "fireSequence must be positive";
+            return false;
+        }
+
         if (command.RequestTick <= 0)
         {
             rejectReason = "requestTick must be positive";
@@ -534,12 +573,6 @@ public sealed class GameWorld
 
         if (!IsFinite(command.AimX)
             || !IsFinite(command.AimZ)
-            || !IsFinite(command.OriginX)
-            || !IsFinite(command.OriginY)
-            || !IsFinite(command.OriginZ)
-            || !IsFinite(command.DirectionX)
-            || !IsFinite(command.DirectionY)
-            || !IsFinite(command.DirectionZ)
             || !IsFinite(command.EstimatedRttSeconds)
             || !IsFinite(command.InterpolationDelaySeconds))
         {
@@ -582,25 +615,6 @@ public sealed class GameWorld
         return aimDistance <= settings.AimToleranceMeters;
     }
 
-    private bool IsRequestedFireDirectionReasonable(FireCommand command, out string rejectReason)
-    {
-        float horizontalDirectionLength = MathF.Sqrt(
-            command.DirectionX * command.DirectionX +
-            command.DirectionZ * command.DirectionZ);
-
-        if (horizontalDirectionLength < settings.MinimumHorizontalFireDirectionLength)
-        {
-            rejectReason =
-                $"requested fire direction is too vertical or too small: " +
-                $"horizontalLength={horizontalDirectionLength:F2}, allowed={settings.MinimumHorizontalFireDirectionLength:F2}, " +
-                $"direction=({command.DirectionX:F2},{command.DirectionY:F2},{command.DirectionZ:F2})";
-            return false;
-        }
-
-        rejectReason = string.Empty;
-        return true;
-    }
-
     private CommandGateResult RejectInput(string reason)
     {
         RejectedInputCount++;
@@ -608,11 +622,11 @@ public sealed class GameWorld
         return CommandGateResult.Rejected(reason);
     }
 
-    private bool RejectFire(string reasonKey)
+    private CommandGateResult RejectFire(string reasonKey)
     {
         RejectedFireRequestCount++;
         IncrementRejectionCount(fireRejectionsByReason, reasonKey);
-        return false;
+        return CommandGateResult.Rejected(reasonKey);
     }
 
     private static void IncrementRejectionCount(Dictionary<string, long> counters, string reason)
@@ -635,16 +649,9 @@ public sealed class GameWorld
 
     private FireRay BuildFireRay(float shooterX, float shooterZ, float shooterBodyYaw, FireCommand command)
     {
-        float directionX = command.DirectionX;
-        float directionZ = command.DirectionZ;
+        float directionX = command.AimX - shooterX;
+        float directionZ = command.AimZ - shooterZ;
         float length = MathF.Sqrt(directionX * directionX + directionZ * directionZ);
-
-        if (length < 0.001f)
-        {
-            directionX = command.AimX - shooterX;
-            directionZ = command.AimZ - shooterZ;
-            length = MathF.Sqrt(directionX * directionX + directionZ * directionZ);
-        }
 
         if (length < 0.001f)
         {
@@ -732,14 +739,13 @@ public sealed class GameWorld
 
 public readonly struct InputCommand
 {
-    public InputCommand(int inputTick, float moveAxis, float turnAxis, float aimX, float aimZ, bool fire)
+    public InputCommand(int inputTick, float moveAxis, float turnAxis, float aimX, float aimZ)
     {
         InputTick = inputTick;
         MoveAxis = moveAxis;
         TurnAxis = turnAxis;
         AimX = aimX;
         AimZ = aimZ;
-        Fire = fire;
     }
 
     public int InputTick { get; }
@@ -747,7 +753,6 @@ public readonly struct InputCommand
     public float TurnAxis { get; }
     public float AimX { get; }
     public float AimZ { get; }
-    public bool Fire { get; }
 }
 
 public readonly struct CommandGateResult
@@ -775,40 +780,25 @@ public readonly struct CommandGateResult
 public readonly struct FireCommand
 {
     public FireCommand(
+        int fireSequence,
         int requestTick,
         float aimX,
         float aimZ,
-        float originX,
-        float originY,
-        float originZ,
-        float directionX,
-        float directionY,
-        float directionZ,
         float estimatedRttSeconds,
         float interpolationDelaySeconds)
     {
+        FireSequence = fireSequence;
         RequestTick = requestTick;
         AimX = aimX;
         AimZ = aimZ;
-        OriginX = originX;
-        OriginY = originY;
-        OriginZ = originZ;
-        DirectionX = directionX;
-        DirectionY = directionY;
-        DirectionZ = directionZ;
         EstimatedRttSeconds = estimatedRttSeconds;
         InterpolationDelaySeconds = interpolationDelaySeconds;
     }
 
+    public int FireSequence { get; }
     public int RequestTick { get; }
     public float AimX { get; }
     public float AimZ { get; }
-    public float OriginX { get; }
-    public float OriginY { get; }
-    public float OriginZ { get; }
-    public float DirectionX { get; }
-    public float DirectionY { get; }
-    public float DirectionZ { get; }
     public float EstimatedRttSeconds { get; }
     public float InterpolationDelaySeconds { get; }
 }
@@ -828,9 +818,12 @@ public sealed class PlayerState
     public int LastCombatServerTick { get; internal set; }
     internal int NextAllowedFireServerTick { get; set; }
     internal int RespawnServerTick { get; set; }
-    internal int LastHandledFireRequestTick { get; set; }
+    internal int LastConsumedInputServerTick { get; set; }
+    internal int LastQueuedFireSequence { get; set; }
+    internal int LastProcessedFireSequence { get; set; }
     internal InputCommand LatestInput { get; set; }
     internal SortedDictionary<int, InputCommand> PendingInputs { get; } = new SortedDictionary<int, InputCommand>();
+    internal SortedDictionary<int, FireCommand> PendingFires { get; } = new SortedDictionary<int, FireCommand>();
     internal List<PlayerHistoryFrame> History { get; } = new List<PlayerHistoryFrame>();
 }
 

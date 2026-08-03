@@ -90,7 +90,7 @@ public sealed class UdpGameServer : IDisposable
                     break;
 
                 case "FireRequest":
-                    await HandleFireRequestAsync(received.RemoteEndPoint, json);
+                    HandleFireRequest(received.RemoteEndPoint, json);
                     break;
 
                 case "ClientGoodbye":
@@ -252,8 +252,7 @@ public sealed class UdpGameServer : IDisposable
                 input.MoveAxis,
                 input.TurnAxis,
                 input.AimX,
-                input.AimZ,
-                input.Fire);
+                input.AimZ);
 
             CommandGateResult result = world.TryQueueInput(client.PlayerId, command);
 
@@ -266,7 +265,7 @@ public sealed class UdpGameServer : IDisposable
         }
     }
 
-    private async Task HandleFireRequestAsync(IPEndPoint remoteEndPoint, string json)
+    private void HandleFireRequest(IPEndPoint remoteEndPoint, string json)
     {
         FireRequestMessage? request;
 
@@ -286,58 +285,37 @@ public sealed class UdpGameServer : IDisposable
             return;
         }
 
-        List<GameWorldEvent> eventsToBroadcast = new List<GameWorldEvent>();
-        List<IPEndPoint> targets;
-        string rejectReason = string.Empty;
-
         lock (stateLock)
         {
             if (!clientRegistry.TryGetClient(remoteEndPoint, out ConnectedClient? client) || client == null)
             {
-                rejectReason = "sender has not completed ClientHello";
+                Console.WriteLine("FireRequest ignored: sender has not completed ClientHello.");
+                return;
             }
-            else if (client.PlayerId != request.PlayerId)
+
+            if (client.PlayerId != request.PlayerId)
             {
-                rejectReason = $"endpoint owns playerId={client.PlayerId}, not {request.PlayerId}";
+                Console.WriteLine($"FireRequest ignored: endpoint owns playerId={client.PlayerId}, not {request.PlayerId}.");
+                return;
             }
-            else
+
+            FireCommand command = new FireCommand(
+                request.FireSequence,
+                request.RequestTick,
+                request.AimX,
+                request.AimZ,
+                request.EstimatedRttSeconds,
+                request.InterpolationDelaySeconds);
+
+            CommandGateResult result = world.TryQueueFire(client.PlayerId, command);
+
+            if (options.LogCommandDecisions || !result.IsAccepted)
             {
-                FireCommand command = new FireCommand(
-                    request.RequestTick,
-                    request.AimX,
-                    request.AimZ,
-                    request.OriginX,
-                    request.OriginY,
-                    request.OriginZ,
-                    request.DirectionX,
-                    request.DirectionY,
-                    request.DirectionZ,
-                    request.EstimatedRttSeconds,
-                    request.InterpolationDelaySeconds);
-
-                bool accepted = world.TryHandleFireRequest(client.PlayerId, command, out eventsToBroadcast, out rejectReason);
-
-                if (options.LogCommandDecisions || !accepted)
-                {
-                    Console.WriteLine(
-                        $"FireRequest {(accepted ? "accepted" : "rejected")}: " +
-                        $"playerId={client.PlayerId}, requestTick={command.RequestTick}, " +
-                        $"reason={(accepted ? "resolved" : rejectReason)}.");
-                }
+                Console.WriteLine(
+                    $"FireRequest {(result.IsAccepted ? "queued" : "rejected")}: " +
+                    $"playerId={client.PlayerId}, sequence={command.FireSequence}, " +
+                    $"requestTick={command.RequestTick}, reason={result.Reason}.");
             }
-
-            targets = clientRegistry.GetAllEndpoints();
-        }
-
-        if (!string.IsNullOrEmpty(rejectReason))
-        {
-            Console.WriteLine($"FireRequest ignored: {rejectReason}.");
-            return;
-        }
-
-        foreach (GameWorldEvent worldEvent in eventsToBroadcast)
-        {
-            await BroadcastGameplayEventAsync(CreateNetworkEvent(worldEvent), targets);
         }
     }
 
