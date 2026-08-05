@@ -7,13 +7,19 @@ public sealed class ClientRegistry
 
     public int Count => clientsByEndPoint.Count;
 
-    public ClientRegistration RegisterOrUpdate(string playerName, IPEndPoint remoteEndPoint, ClientReplicationSettings replicationSettings)
+    public ClientRegistration RegisterOrUpdate(string playerName, IPEndPoint remoteEndPoint, ClientReplicationSettings replicationSettings, ReliableEventSettings? reliableEventSettings = null)
     {
         string clientKey = GetClientKey(remoteEndPoint);
 
         if (!clientsByEndPoint.TryGetValue(clientKey, out ConnectedClient? client))
         {
-            client = new ConnectedClient(nextPlayerId, playerName, remoteEndPoint, new ClientReplicator(replicationSettings));
+            ReliableEventSettings settings = reliableEventSettings ?? new ReliableEventSettings();
+            client = new ConnectedClient(
+                nextPlayerId,
+                playerName,
+                remoteEndPoint,
+                new ClientReplicator(replicationSettings),
+                new ReliableEventLedger(TimeSpan.FromSeconds(Math.Max(0f, settings.ResendIntervalSeconds)), settings.MaximumResendCount));
             nextPlayerId++;
             clientsByEndPoint.Add(clientKey, client);
             return new ClientRegistration(client, true);
@@ -92,12 +98,13 @@ public sealed class ClientRegistry
 
 public sealed class ConnectedClient
 {
-    public ConnectedClient(int playerId, string name, IPEndPoint remoteEndPoint, ClientReplicator replicator)
+    public ConnectedClient(int playerId, string name, IPEndPoint remoteEndPoint, ClientReplicator replicator, ReliableEventLedger reliableEvents)
     {
         PlayerId = playerId;
         Name = name;
         RemoteEndPoint = remoteEndPoint;
         Replicator = replicator;
+        ReliableEvents = reliableEvents;
         LastReceivedUtc = DateTime.UtcNow;
     }
 
@@ -105,6 +112,7 @@ public sealed class ConnectedClient
     public string Name { get; set; }
     public IPEndPoint RemoteEndPoint { get; set; }
     public ClientReplicator Replicator { get; }
+    public ReliableEventLedger ReliableEvents { get; }
     public DateTime LastReceivedUtc { get; set; }
 }
 

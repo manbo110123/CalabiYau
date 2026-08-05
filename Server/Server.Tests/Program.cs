@@ -17,8 +17,13 @@ internal static class Program
         SnapshotSequenceIsIndependentFromServerTick();
         DistanceFilteringIsTheDefaultReplicationMode();
         InactiveClientsAreRemovedFromTheRegistry();
+        ReliableEventsResendOnlyAfterTheirInterval();
+        AcknowledgedReliableEventsDoNotResend();
+        ReliableEventsStopAfterTheirRetryLimit();
+        DuplicateReliableEventIdsAreAppliedOnlyOnce();
+        SnapshotsContinueWhileReliableEventsAwaitAcknowledgement();
 
-        Console.WriteLine("GameWorld command timeline, reliable fire receipt, and stage-11 replication checks passed.");
+        Console.WriteLine("GameWorld command timeline, reliable fire receipt, replication, and reliable result-event checks passed.");
     }
 
     private static void DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward()
@@ -229,6 +234,78 @@ internal static class Program
 
         Assert(firstPlan.Snapshot.SnapshotSequence == 1, "first snapshot sequence should start at one");
         Assert(secondPlan.Snapshot.SnapshotSequence == 2, "every datagram needs its own sequence even at the same simulation Tick");
+    }
+
+    private static void ReliableEventsResendOnlyAfterTheirInterval()
+    {
+        ReliableEventLedger ledger = new ReliableEventLedger(TimeSpan.FromMilliseconds(100), 2);
+        DateTime firstSend = DateTime.UtcNow;
+        ledger.QueueInitial(1, "{\"type\":\"DeathEvent\",\"eventId\":1}", 10, new[] { 2 }, firstSend);
+
+        Assert(ledger.CollectDueResends(firstSend.AddMilliseconds(99)).Count == 0, "a reliable event must not resend before its interval");
+        List<PendingReliableEvent> firstResend = ledger.CollectDueResends(firstSend.AddMilliseconds(100));
+        Assert(firstResend.Count == 1 && firstResend[0].EventId == 1, "an unacknowledged reliable event must resend at its interval");
+        Assert(firstResend[0].ResendCount == 1, "the ledger should retain the per-event resend count");
+        Assert(ledger.GetTelemetry().ResendCount == 1, "resend telemetry should record the resend");
+    }
+
+    private static void AcknowledgedReliableEventsDoNotResend()
+    {
+        ReliableEventLedger ledger = new ReliableEventLedger(TimeSpan.FromMilliseconds(100), 2);
+        DateTime firstSend = DateTime.UtcNow;
+        ledger.QueueInitial(3, "{\"type\":\"RespawnEvent\",\"eventId\":3}", 20, new[] { 1 }, firstSend);
+
+        Assert(ledger.Acknowledge(3, firstSend.AddMilliseconds(25)), "the matching client acknowledgement should remove its pending event");
+        Assert(ledger.PendingCount == 0, "acknowledged event must leave that client ledger");
+        Assert(ledger.CollectDueResends(firstSend.AddSeconds(1)).Count == 0, "an acknowledged event must never resend");
+        Assert(ledger.GetTelemetry().AcknowledgedCount == 1, "acknowledgement telemetry should be observable");
+    }
+
+    private static void ReliableEventsStopAfterTheirRetryLimit()
+    {
+        ReliableEventLedger ledger = new ReliableEventLedger(TimeSpan.FromMilliseconds(100), 1);
+        DateTime firstSend = DateTime.UtcNow;
+        ledger.QueueInitial(5, "{\"type\":\"KillEvent\",\"eventId\":5}", 30, new[] { 1, 2 }, firstSend);
+
+        Assert(ledger.CollectDueResends(firstSend.AddMilliseconds(100)).Count == 1, "the configured first resend should be sent");
+        Assert(ledger.CollectDueResends(firstSend.AddMilliseconds(200)).Count == 0, "the event should stop once its resend limit is reached");
+        Assert(ledger.PendingCount == 0, "retry-limit events must not remain pending forever");
+        Assert(ledger.GetTelemetry().RetryLimitExceededCount == 1, "retry-limit telemetry should record the capped event");
+    }
+
+    private static void DuplicateReliableEventIdsAreAppliedOnlyOnce()
+    {
+        RecentReliableEventIds received = new RecentReliableEventIds(2);
+        int appliedCount = 0;
+
+        if (received.TryRecord(42))
+        {
+            appliedCount++;
+        }
+
+        if (received.TryRecord(42))
+        {
+            appliedCount++;
+        }
+
+        Assert(appliedCount == 1, "the same reliable event id should be applied only once");
+        Assert(received.Count == 1, "duplicate reliable ids must not grow the recent-id set");
+    }
+
+    private static void SnapshotsContinueWhileReliableEventsAwaitAcknowledgement()
+    {
+        GameWorld world = CreateWorldWithThreePlayers();
+        SnapshotBuilder builder = new SnapshotBuilder();
+        ClientReplicator replicator = new ClientReplicator(new ClientReplicationSettings());
+        ReliableEventLedger ledger = new ReliableEventLedger(TimeSpan.FromSeconds(1), 1);
+        ledger.QueueInitial(9, "{\"type\":\"DeathEvent\",\"eventId\":9}", 1, new[] { 2 }, DateTime.UtcNow);
+
+        ClientSnapshotPlan firstSnapshot = replicator.BuildSnapshot(1, 1, 30, builder.Capture(world));
+        ClientSnapshotPlan nextSnapshot = replicator.BuildSnapshot(1, 2, 30, builder.Capture(world));
+
+        Assert(ledger.PendingCount == 1, "the test event should still be awaiting acknowledgement");
+        Assert(firstSnapshot.Snapshot.SnapshotSequence == 1 && nextSnapshot.Snapshot.SnapshotSequence == 2,
+            "WorldSnapshot emission must continue independently while an event awaits acknowledgement");
     }
 
     private static GameWorld CreateWorldWithThreePlayers()

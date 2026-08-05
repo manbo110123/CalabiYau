@@ -15,6 +15,7 @@
     <Compile Include="..\Server\SnapshotBuilder.cs" Link="SnapshotBuilder.cs" />
     <Compile Include="..\Server\ClientReplicator.cs" Link="ClientReplicator.cs" />
     <Compile Include="..\Server\ClientRegistry.cs" Link="ClientRegistry.cs" />
+    <Compile Include="..\Server\ReliableEventLedger.cs" Link="ReliableEventLedger.cs" />
   </ItemGroup>
 
 </Project>

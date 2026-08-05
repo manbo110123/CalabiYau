@@ -280,3 +280,76 @@ public sealed class HealthChangedEventMessage
     [JsonPropertyName("respawnRemainingSeconds")]
     public float RespawnRemainingSeconds { get; set; }
 }
+
+public sealed class EventAckMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+
+    [JsonPropertyName("eventId")]
+    public long EventId { get; set; }
+}
+
+public sealed class DeathEventMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+    [JsonPropertyName("eventId")]
+    public long EventId { get; set; }
+    [JsonPropertyName("serverTick")]
+    public int ServerTick { get; set; }
+    [JsonPropertyName("playerId")]
+    public int PlayerId { get; set; }
+    [JsonPropertyName("killerPlayerId")]
+    public int KillerPlayerId { get; set; }
+    [JsonPropertyName("respawnRemainingSeconds")]
+    public float RespawnRemainingSeconds { get; set; }
+}
+
+public sealed class RespawnEventMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+    [JsonPropertyName("eventId")]
+    public long EventId { get; set; }
+    [JsonPropertyName("serverTick")]
+    public int ServerTick { get; set; }
+    [JsonPropertyName("playerId")]
+    public int PlayerId { get; set; }
+    [JsonPropertyName("x")]
+    public float X { get; set; }
+    [JsonPropertyName("y")]
+    public float Y { get; set; }
+    [JsonPropertyName("z")]
+    public float Z { get; set; }
+    [JsonPropertyName("health")]
+    public int Health { get; set; }
+    [JsonPropertyName("maxHealth")]
+    public int MaxHealth { get; set; }
+}
+
+public sealed class KillEventMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+    [JsonPropertyName("eventId")]
+    public long EventId { get; set; }
+    [JsonPropertyName("serverTick")]
+    public int ServerTick { get; set; }
+    [JsonPropertyName("killerPlayerId")]
+    public int KillerPlayerId { get; set; }
+    [JsonPropertyName("victimPlayerId")]
+    public int VictimPlayerId { get; set; }
+}
+
+public sealed class MatchEndEventMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+    [JsonPropertyName("eventId")]
+    public long EventId { get; set; }
+    [JsonPropertyName("serverTick")]
+    public int ServerTick { get; set; }
+    [JsonPropertyName("winnerPlayerId")]
+    public int WinnerPlayerId { get; set; }
+}

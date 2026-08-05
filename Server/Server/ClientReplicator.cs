@@ -143,6 +143,21 @@ public sealed class ClientReplicator
         };
     }
 
+    public bool IsPlayerInReplicationScope(int recipientPlayerId, int subjectPlayerId, IReadOnlyList<ReplicationCandidate> candidates)
+    {
+        ReplicationCandidate? recipient = candidates.SingleOrDefault(candidate => candidate.State.PlayerId == recipientPlayerId);
+        ReplicationCandidate? subject = candidates.SingleOrDefault(candidate => candidate.State.PlayerId == subjectPlayerId);
+
+        if (recipient == null || subject == null)
+        {
+            return false;
+        }
+
+        return !settings.EnableDistanceFiltering
+            || recipientPlayerId == subjectPlayerId
+            || GetGroundDistance(recipient.State, subject.State) <= settings.ReplicationDistanceMeters;
+    }
+
     public void RecordSentSnapshot(int byteCount, ClientSnapshotPlan plan)
     {
         sentSnapshotCountSinceTelemetry++;

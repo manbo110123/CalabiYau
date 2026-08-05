@@ -259,11 +259,11 @@ public sealed class GameWorld
 
         foreach (PlayerState player in playersById.Values)
         {
-            HealthChangedWorldEvent? respawnEvent = TryRespawnPlayer(player);
+            List<GameWorldEvent>? respawnEvents = TryRespawnPlayer(player);
 
-            if (respawnEvent != null)
+            if (respawnEvents != null)
             {
-                eventsToBroadcast.Add(respawnEvent);
+                eventsToBroadcast.AddRange(respawnEvents);
             }
 
             ConsumeLatestInputForTick(player);
@@ -366,6 +366,23 @@ public sealed class GameWorld
                 });
 
                 eventsToBroadcast.Add(CreateHealthChangedEvent(hitPlayer));
+
+                if (hitPlayer.Health <= 0)
+                {
+                    eventsToBroadcast.Add(new DeathWorldEvent
+                    {
+                        ServerTick = ServerTick,
+                        PlayerId = hitPlayer.PlayerId,
+                        KillerPlayerId = shooter.PlayerId,
+                        RespawnRemainingSeconds = GetRespawnRemainingSeconds(hitPlayer)
+                    });
+                    eventsToBroadcast.Add(new KillWorldEvent
+                    {
+                        ServerTick = ServerTick,
+                        KillerPlayerId = shooter.PlayerId,
+                        VictimPlayerId = hitPlayer.PlayerId
+                    });
+                }
             }
         }
 
@@ -447,7 +464,7 @@ public sealed class GameWorld
         DeathCount++;
     }
 
-    private HealthChangedWorldEvent? TryRespawnPlayer(PlayerState player)
+    private List<GameWorldEvent>? TryRespawnPlayer(PlayerState player)
     {
         if (player.IsAlive || player.RespawnServerTick <= 0 || ServerTick < player.RespawnServerTick)
         {
@@ -470,7 +487,20 @@ public sealed class GameWorld
         player.PendingFires.Clear();
         RespawnCount++;
 
-        return CreateHealthChangedEvent(player);
+        return new List<GameWorldEvent>
+        {
+            CreateHealthChangedEvent(player),
+            new RespawnWorldEvent
+            {
+                ServerTick = ServerTick,
+                PlayerId = player.PlayerId,
+                X = player.X,
+                Y = player.Y,
+                Z = player.Z,
+                Health = player.Health,
+                MaxHealth = settings.MaxHealth
+            }
+        };
     }
 
     // The buffer is sorted for deterministic inspection, but each server tick uses the
@@ -949,6 +979,34 @@ public sealed class HealthChangedWorldEvent : GameWorldEvent
     public int MaxHealth { get; init; }
     public bool IsAlive { get; init; }
     public float RespawnRemainingSeconds { get; init; }
+}
+
+public sealed class DeathWorldEvent : GameWorldEvent
+{
+    public int PlayerId { get; init; }
+    public int KillerPlayerId { get; init; }
+    public float RespawnRemainingSeconds { get; init; }
+}
+
+public sealed class RespawnWorldEvent : GameWorldEvent
+{
+    public int PlayerId { get; init; }
+    public float X { get; init; }
+    public float Y { get; init; }
+    public float Z { get; init; }
+    public int Health { get; init; }
+    public int MaxHealth { get; init; }
+}
+
+public sealed class KillWorldEvent : GameWorldEvent
+{
+    public int KillerPlayerId { get; init; }
+    public int VictimPlayerId { get; init; }
+}
+
+public sealed class MatchEndWorldEvent : GameWorldEvent
+{
+    public int WinnerPlayerId { get; init; }
 }
 
 internal struct FireRay

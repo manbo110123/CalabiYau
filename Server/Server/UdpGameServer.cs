@@ -14,6 +14,7 @@ public sealed class UdpGameServerOptions
     public float ClientTimeoutSeconds { get; set; } = 8f;
     public GameWorldSettings WorldSettings { get; set; } = new GameWorldSettings();
     public ClientReplicationSettings ReplicationSettings { get; set; } = new ClientReplicationSettings();
+    public ReliableEventSettings ReliableEventSettings { get; set; } = new ReliableEventSettings();
 }
 
 // Owns transport, routing, and the fixed-rate loop. It never changes PlayerState directly.
@@ -27,6 +28,8 @@ public sealed class UdpGameServer : IDisposable
     private readonly SnapshotBuilder snapshotBuilder = new SnapshotBuilder();
     private long sentSnapshotCount;
     private long sentGameplayEventCount;
+    private long sentReliableEventDatagramCount;
+    private long nextReliableEventId;
     private float snapshotSendAccumulator;
 
     public UdpGameServer(UdpGameServerOptions options)
@@ -93,6 +96,10 @@ public sealed class UdpGameServer : IDisposable
                     await HandleFireRequestAsync(received.RemoteEndPoint, json);
                     break;
 
+                case "EventAck":
+                    HandleEventAck(received.RemoteEndPoint, json);
+                    break;
+
                 case "ClientGoodbye":
                     HandleClientGoodbye(received.RemoteEndPoint);
                     break;
@@ -116,7 +123,8 @@ public sealed class UdpGameServer : IDisposable
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
             List<SnapshotSendWork> snapshotSendWork = new List<SnapshotSendWork>();
-            List<IPEndPoint> targets;
+            List<UnreliableEventSendWork> unreliableEventSendWork = new List<UnreliableEventSendWork>();
+            List<ReliableEventSendWork> reliableEventSendWork = new List<ReliableEventSendWork>();
             List<GameWorldEvent> worldEvents;
 
             lock (stateLock)
@@ -132,7 +140,55 @@ public sealed class UdpGameServer : IDisposable
                 }
 
                 worldEvents = world.Tick(tickDeltaTime);
-                targets = clientRegistry.GetAllEndpoints();
+                IReadOnlyList<ReplicationCandidate> candidates = snapshotBuilder.Capture(world);
+                DateTime nowUtc = DateTime.UtcNow;
+
+                foreach (ConnectedClient client in clientRegistry.GetAllClients())
+                {
+                    client.ReliableEvents.DiscardOutsideReplicationScope(pending =>
+                        IsEventRelevantToClient(client, pending.RelatedPlayerIds, candidates));
+
+                    foreach (PendingReliableEvent pending in client.ReliableEvents.CollectDueResends(nowUtc))
+                    {
+                        reliableEventSendWork.Add(new ReliableEventSendWork(client.RemoteEndPoint, pending.Json));
+                    }
+                }
+
+                foreach (GameWorldEvent worldEvent in worldEvents)
+                {
+                    object networkEvent = CreateNetworkEvent(worldEvent);
+                    int[] relatedPlayerIds = GetRelatedPlayerIds(worldEvent);
+                    bool isReliable = IsReliableWorldEvent(worldEvent);
+                    string eventJson = JsonSerializer.Serialize(networkEvent, networkEvent.GetType());
+
+                    if (isReliable)
+                    {
+                        long eventId = ++nextReliableEventId;
+                        SetReliableEventId(networkEvent, eventId);
+                        eventJson = JsonSerializer.Serialize(networkEvent, networkEvent.GetType());
+
+                        foreach (ConnectedClient client in clientRegistry.GetAllClients())
+                        {
+                            if (!IsEventRelevantToClient(client, relatedPlayerIds, candidates))
+                            {
+                                continue;
+                            }
+
+                            client.ReliableEvents.QueueInitial(eventId, eventJson, worldEvent.ServerTick, relatedPlayerIds, nowUtc);
+                            reliableEventSendWork.Add(new ReliableEventSendWork(client.RemoteEndPoint, eventJson));
+                        }
+                    }
+                    else
+                    {
+                        foreach (ConnectedClient client in clientRegistry.GetAllClients())
+                        {
+                            if (IsEventRelevantToClient(client, relatedPlayerIds, candidates))
+                            {
+                                unreliableEventSendWork.Add(new UnreliableEventSendWork(client.RemoteEndPoint, eventJson));
+                            }
+                        }
+                    }
+                }
 
                 snapshotSendAccumulator += tickDeltaTime;
                 float snapshotIntervalSeconds = 1f / GetSnapshotRate();
@@ -140,8 +196,6 @@ public sealed class UdpGameServer : IDisposable
                 if (snapshotSendAccumulator >= snapshotIntervalSeconds)
                 {
                     snapshotSendAccumulator -= snapshotIntervalSeconds;
-                    IReadOnlyList<ReplicationCandidate> candidates = snapshotBuilder.Capture(world);
-
                     foreach (ConnectedClient client in clientRegistry.GetAllClients())
                     {
                         ClientSnapshotPlan plan = client.Replicator.BuildSnapshot(
@@ -159,9 +213,16 @@ public sealed class UdpGameServer : IDisposable
                 await SendSnapshotAsync(work);
             }
 
-            foreach (GameWorldEvent worldEvent in worldEvents)
+            foreach (UnreliableEventSendWork work in unreliableEventSendWork)
             {
-                await BroadcastGameplayEventAsync(CreateNetworkEvent(worldEvent), targets);
+                await SendRawJsonAsync(work.Json, work.Target);
+                sentGameplayEventCount++;
+            }
+
+            foreach (ReliableEventSendWork work in reliableEventSendWork)
+            {
+                await SendRawJsonAsync(work.Json, work.Target);
+                sentReliableEventDatagramCount++;
             }
 
             if (world.ServerTick % Math.Max(1, options.TickRate) == 0)
@@ -190,7 +251,7 @@ public sealed class UdpGameServer : IDisposable
 
         lock (stateLock)
         {
-            registration = clientRegistry.RegisterOrUpdate(playerName, remoteEndPoint, options.ReplicationSettings);
+            registration = clientRegistry.RegisterOrUpdate(playerName, remoteEndPoint, options.ReplicationSettings, options.ReliableEventSettings);
 
             if (registration.IsNewClient)
             {
@@ -359,6 +420,41 @@ public sealed class UdpGameServer : IDisposable
         }
     }
 
+    private void HandleEventAck(IPEndPoint remoteEndPoint, string json)
+    {
+        EventAckMessage? acknowledgement;
+
+        try
+        {
+            acknowledgement = JsonSerializer.Deserialize<EventAckMessage>(json);
+        }
+        catch (JsonException exception)
+        {
+            Console.WriteLine($"EventAck ignored: invalid JSON. {exception.Message}");
+            return;
+        }
+
+        if (acknowledgement == null || acknowledgement.EventId <= 0)
+        {
+            Console.WriteLine("EventAck ignored: eventId must be positive.");
+            return;
+        }
+
+        lock (stateLock)
+        {
+            if (!clientRegistry.TryGetClient(remoteEndPoint, out ConnectedClient? client) || client == null)
+            {
+                Console.WriteLine("EventAck ignored: sender has not completed ClientHello.");
+                return;
+            }
+
+            if (!client.ReliableEvents.Acknowledge(acknowledgement.EventId, DateTime.UtcNow))
+            {
+                Console.WriteLine($"EventAck ignored: client={client.PlayerId}, eventId={acknowledgement.EventId} is not pending.");
+            }
+        }
+    }
+
     private void LogServerTelemetry()
     {
         Console.WriteLine(
@@ -369,16 +465,20 @@ public sealed class UdpGameServer : IDisposable
             $"distanceFiltering={options.ReplicationSettings.EnableDistanceFiltering}, " +
             $"fire={world.AcceptedFireRequestCount}/{world.ReceivedFireRequestCount}, " +
             $"fireRejected={world.RejectedFireRequestCount}, fireReasons=[{world.GetFireRejectionSummary()}], " +
-            $"events={sentGameplayEventCount}, lagCompFire={world.LagCompensatedFireRequestCount}, " +
+            $"events={sentGameplayEventCount}, reliableEventDatagrams={sentReliableEventDatagramCount}, lagCompFire={world.LagCompensatedFireRequestCount}, " +
             $"deaths={world.DeathCount}, respawns={world.RespawnCount}");
 
         foreach (ConnectedClient client in clientRegistry.GetAllClients().OrderBy(client => client.PlayerId))
         {
             ClientReplicationTelemetry telemetry = client.Replicator.ConsumeTelemetry();
+            ReliableEventLedgerTelemetry reliableTelemetry = client.ReliableEvents.GetTelemetry();
             Console.WriteLine(
                 $"Replication client={client.PlayerId}, snapshots={telemetry.SnapshotCount}/s, " +
                 $"statePlayers={telemetry.LastPlayerCount}, scopePlayers={telemetry.LastScopedPlayerCount}, " +
-                $"bytes={telemetry.ByteCount}/s.");
+                $"bytes={telemetry.ByteCount}/s, reliablePending={reliableTelemetry.PendingCount}, " +
+                $"reliableResends={reliableTelemetry.ResendCount}, acked={reliableTelemetry.AcknowledgedCount}, " +
+                $"avgAck={reliableTelemetry.AverageAcknowledgementLatencyMilliseconds:F0}ms, " +
+                $"retryLimit={reliableTelemetry.RetryLimitExceededCount}.");
         }
     }
 
@@ -387,18 +487,10 @@ public sealed class UdpGameServer : IDisposable
         return Math.Clamp(options.ReplicationSettings.SnapshotRate, 1, Math.Max(1, options.TickRate));
     }
 
-    private async Task BroadcastGameplayEventAsync(object message, List<IPEndPoint> targets)
+    private async Task SendRawJsonAsync(string json, IPEndPoint target)
     {
-        string json = JsonSerializer.Serialize(message, message.GetType());
         byte[] bytes = Encoding.UTF8.GetBytes(json);
-
-        foreach (IPEndPoint target in targets)
-        {
-            await udpServer.SendAsync(bytes, bytes.Length, target);
-        }
-
-        sentGameplayEventCount++;
-        Console.WriteLine($"Broadcast gameplay event: {json}");
+        await udpServer.SendAsync(bytes, bytes.Length, target);
     }
 
     private async Task SendJsonAsync<TMessage>(TMessage message, IPEndPoint target)
@@ -478,8 +570,100 @@ public sealed class UdpGameServer : IDisposable
                     RespawnRemainingSeconds = healthEvent.RespawnRemainingSeconds
                 };
 
+            case DeathWorldEvent deathEvent:
+                return new DeathEventMessage
+                {
+                    Type = "DeathEvent",
+                    ServerTick = deathEvent.ServerTick,
+                    PlayerId = deathEvent.PlayerId,
+                    KillerPlayerId = deathEvent.KillerPlayerId,
+                    RespawnRemainingSeconds = deathEvent.RespawnRemainingSeconds
+                };
+
+            case RespawnWorldEvent respawnEvent:
+                return new RespawnEventMessage
+                {
+                    Type = "RespawnEvent",
+                    ServerTick = respawnEvent.ServerTick,
+                    PlayerId = respawnEvent.PlayerId,
+                    X = respawnEvent.X,
+                    Y = respawnEvent.Y,
+                    Z = respawnEvent.Z,
+                    Health = respawnEvent.Health,
+                    MaxHealth = respawnEvent.MaxHealth
+                };
+
+            case KillWorldEvent killEvent:
+                return new KillEventMessage
+                {
+                    Type = "KillEvent",
+                    ServerTick = killEvent.ServerTick,
+                    KillerPlayerId = killEvent.KillerPlayerId,
+                    VictimPlayerId = killEvent.VictimPlayerId
+                };
+
+            case MatchEndWorldEvent matchEndEvent:
+                return new MatchEndEventMessage
+                {
+                    Type = "MatchEndEvent",
+                    ServerTick = matchEndEvent.ServerTick,
+                    WinnerPlayerId = matchEndEvent.WinnerPlayerId
+                };
+
             default:
                 throw new InvalidOperationException($"Unsupported world event '{worldEvent.GetType().Name}'.");
+        }
+    }
+
+    private static bool IsReliableWorldEvent(GameWorldEvent worldEvent)
+    {
+        return worldEvent is DeathWorldEvent
+            || worldEvent is RespawnWorldEvent
+            || worldEvent is KillWorldEvent
+            || worldEvent is MatchEndWorldEvent;
+    }
+
+    private static int[] GetRelatedPlayerIds(GameWorldEvent worldEvent)
+    {
+        return worldEvent switch
+        {
+            FireResolvedEvent fireEvent => new[] { fireEvent.ShooterPlayerId },
+            HitResolvedEvent hitEvent => new[] { hitEvent.ShooterPlayerId, hitEvent.TargetPlayerId },
+            HealthChangedWorldEvent healthEvent => new[] { healthEvent.PlayerId },
+            // Death and respawn drive an Avatar's local visual state, so only the affected
+            // entity being in scope makes them eligible for delivery.
+            DeathWorldEvent deathEvent => new[] { deathEvent.PlayerId },
+            RespawnWorldEvent respawnEvent => new[] { respawnEvent.PlayerId },
+            KillWorldEvent killEvent => new[] { killEvent.KillerPlayerId, killEvent.VictimPlayerId },
+            MatchEndWorldEvent => Array.Empty<int>(),
+            _ => Array.Empty<int>()
+        };
+    }
+
+    private static bool IsEventRelevantToClient(ConnectedClient client, int[] relatedPlayerIds, IReadOnlyList<ReplicationCandidate> candidates)
+    {
+        return relatedPlayerIds.Length == 0
+            || relatedPlayerIds.Any(playerId => client.Replicator.IsPlayerInReplicationScope(client.PlayerId, playerId, candidates));
+    }
+
+    private static void SetReliableEventId(object networkEvent, long eventId)
+    {
+        switch (networkEvent)
+        {
+            case DeathEventMessage deathEvent:
+                deathEvent.EventId = eventId;
+                break;
+            case RespawnEventMessage respawnEvent:
+                respawnEvent.EventId = eventId;
+                break;
+            case KillEventMessage killEvent:
+                killEvent.EventId = eventId;
+                break;
+            case MatchEndEventMessage matchEndEvent:
+                matchEndEvent.EventId = eventId;
+                break;
+            default:
+                throw new InvalidOperationException($"Event '{networkEvent.GetType().Name}' is not a reliable event.");
         }
     }
 
@@ -493,5 +677,29 @@ public sealed class UdpGameServer : IDisposable
 
         public ConnectedClient Client { get; }
         public ClientSnapshotPlan Plan { get; }
+    }
+
+    private readonly struct UnreliableEventSendWork
+    {
+        public UnreliableEventSendWork(IPEndPoint target, string json)
+        {
+            Target = target;
+            Json = json;
+        }
+
+        public IPEndPoint Target { get; }
+        public string Json { get; }
+    }
+
+    private readonly struct ReliableEventSendWork
+    {
+        public ReliableEventSendWork(IPEndPoint target, string json)
+        {
+            Target = target;
+            Json = json;
+        }
+
+        public IPEndPoint Target { get; }
+        public string Json { get; }
     }
 }

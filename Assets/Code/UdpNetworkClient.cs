@@ -52,6 +52,9 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private float fireReceiptTimeoutSeconds = 0.2f;
     [SerializeField] private int maxFireRequestResends = 3;
 
+    [Header("Reliable Result Events")]
+    [SerializeField] private int processedReliableEventCapacity = 128;
+
     [Header("Debug")]
     [SerializeField] private bool logJsonMessages = false;
     [SerializeField] private bool logSnapshots = false;
@@ -91,6 +94,8 @@ public class UdpNetworkClient : MonoBehaviour
     private string lastFireReceiptReason = string.Empty;
     private int lastFireReceiptServerTick;
     private int receivedGameplayEventCount;
+    private int receivedReliableEventCount;
+    private int duplicateReliableEventDropCount;
     private bool isLocalAlive = true;
     private int lastReceivedSnapshotTick;
     private uint lastReceivedSnapshotSequence;
@@ -119,6 +124,7 @@ public class UdpNetworkClient : MonoBehaviour
     private readonly List<BufferedLocalInput> localInputHistory = new List<BufferedLocalInput>();
     private readonly Queue<float> recentPredictionCorrectionTimes = new Queue<float>();
     private readonly Dictionary<int, PendingFireRequest> pendingFireRequests = new Dictionary<int, PendingFireRequest>();
+    private readonly RecentReliableEventIds processedReliableEventIds = new RecentReliableEventIds();
 
     public int PlayerId => playerId;
     public int LastAuthoritativeServerTick => lastAuthoritativeServerTick;
@@ -587,6 +593,22 @@ public class UdpNetworkClient : MonoBehaviour
                 HandleHealthChangedEvent(json);
                 break;
 
+            case "DeathEvent":
+                HandleDeathEvent(json);
+                break;
+
+            case "RespawnEvent":
+                HandleRespawnEvent(json);
+                break;
+
+            case "KillEvent":
+                HandleKillEvent(json);
+                break;
+
+            case "MatchEndEvent":
+                HandleMatchEndEvent(json);
+                break;
+
             default:
                 Debug.LogWarning($"UDP message ignored: unsupported type '{header.type}'.");
                 break;
@@ -769,6 +791,110 @@ public class UdpNetworkClient : MonoBehaviour
                 $"health={healthEvent.health}/{healthEvent.maxHealth}, alive={healthEvent.isAlive}, " +
                 $"respawnIn={healthEvent.respawnRemainingSeconds:F1}s");
         }
+    }
+
+    private void HandleDeathEvent(string json)
+    {
+        DeathEventMessage deathEvent = JsonUtility.FromJson<DeathEventMessage>(json);
+        ProcessReliableEvent(deathEvent.eventId, () =>
+        {
+            receivedGameplayEventCount++;
+            NetworkTankAvatar avatar = GetAvatarByPlayerId(deathEvent.playerId);
+
+            if (avatar != null)
+            {
+                avatar.ApplyNetworkHealth(0, avatar.MaxHealth, false);
+                avatar.SetRespawnRemainingSeconds(deathEvent.respawnRemainingSeconds);
+            }
+
+            if (deathEvent.playerId == playerId)
+            {
+                SetLocalAliveFromServer(false, null, deathEvent.serverTick);
+            }
+
+            if (logGameplayEvents)
+            {
+                Debug.Log($"DeathEvent eventId={deathEvent.eventId}, tick={deathEvent.serverTick}, player={deathEvent.playerId}, killer={deathEvent.killerPlayerId}.");
+            }
+        });
+    }
+
+    private void HandleRespawnEvent(string json)
+    {
+        RespawnEventMessage respawnEvent = JsonUtility.FromJson<RespawnEventMessage>(json);
+        ProcessReliableEvent(respawnEvent.eventId, () =>
+        {
+            receivedGameplayEventCount++;
+            NetworkTankAvatar avatar = GetAvatarByPlayerId(respawnEvent.playerId);
+
+            if (avatar != null)
+            {
+                avatar.ApplyNetworkHealth(respawnEvent.health, respawnEvent.maxHealth, true);
+                avatar.SetRespawnRemainingSeconds(0f);
+            }
+
+            if (respawnEvent.playerId == playerId)
+            {
+                SetLocalAliveFromServer(true, null, respawnEvent.serverTick);
+            }
+
+            if (logGameplayEvents)
+            {
+                Debug.Log($"RespawnEvent eventId={respawnEvent.eventId}, tick={respawnEvent.serverTick}, player={respawnEvent.playerId}.");
+            }
+        });
+    }
+
+    private void HandleKillEvent(string json)
+    {
+        KillEventMessage killEvent = JsonUtility.FromJson<KillEventMessage>(json);
+        ProcessReliableEvent(killEvent.eventId, () =>
+        {
+            receivedGameplayEventCount++;
+            if (logGameplayEvents)
+            {
+                Debug.Log($"KillEvent eventId={killEvent.eventId}, tick={killEvent.serverTick}, killer={killEvent.killerPlayerId}, victim={killEvent.victimPlayerId}.");
+            }
+        });
+    }
+
+    private void HandleMatchEndEvent(string json)
+    {
+        MatchEndEventMessage matchEndEvent = JsonUtility.FromJson<MatchEndEventMessage>(json);
+        ProcessReliableEvent(matchEndEvent.eventId, () =>
+        {
+            receivedGameplayEventCount++;
+            Debug.Log($"MatchEndEvent eventId={matchEndEvent.eventId}, tick={matchEndEvent.serverTick}, winner={matchEndEvent.winnerPlayerId}.");
+        });
+    }
+
+    private void ProcessReliableEvent(long eventId, Action applyOnce)
+    {
+        if (eventId <= 0)
+        {
+            Debug.LogWarning("Reliable event ignored: eventId must be positive.");
+            return;
+        }
+
+        if (processedReliableEventIds.TryRecord(eventId, processedReliableEventCapacity))
+        {
+            receivedReliableEventCount++;
+            applyOnce();
+        }
+        else
+        {
+            duplicateReliableEventDropCount++;
+        }
+
+        SendEventAck(eventId);
+    }
+
+    private void SendEventAck(long eventId)
+    {
+        EventAckMessage acknowledgement = new EventAckMessage();
+        acknowledgement.type = "EventAck";
+        acknowledgement.eventId = eventId;
+        SendJson(JsonUtility.ToJson(acknowledgement));
     }
 
     private void ApplyPlayerSnapshot(int serverTick, PlayerSnapshotMessage snapshot)
@@ -988,6 +1114,9 @@ public class UdpNetworkClient : MonoBehaviour
         lastFireReceiptReason = string.Empty;
         lastFireReceiptServerTick = 0;
         receivedGameplayEventCount = 0;
+        receivedReliableEventCount = 0;
+        duplicateReliableEventDropCount = 0;
+        processedReliableEventIds.Clear();
     }
 
     private void RecordSnapshotStats(int serverTick, uint snapshotSequence)
@@ -1512,7 +1641,7 @@ public class UdpNetworkClient : MonoBehaviour
 
         EnsureDebugPanelStyles();
 
-        const int debugRowCount = 20;
+        const int debugRowCount = 21;
         const float titleHeight = 28f;
         const float rowHeight = 24f;
         const float panelPaddingHeight = 28f;
@@ -1543,6 +1672,7 @@ public class UdpNetworkClient : MonoBehaviour
         DrawDebugRow("Filtered remote cleanup", removedRemoteAvatarCount.ToString());
         DrawDebugRow("Fire request receipts", FormatFireReceiptDeliveryText());
         DrawDebugRow("Last fire receipt", FormatLastFireReceiptText());
+        DrawDebugRow("Reliable results", FormatReliableResultEventsText());
         DrawDebugRow("Fire lag compensation", FormatLagCompensationText());
         DrawDebugRow("Correction budget", FormatCorrectionBudgetText());
         DrawDebugRow("Smooth correction", $"{smoothCorrectionSpeed:F1}/s, max {smoothCorrectionMaxSeconds:F2}s");
@@ -1759,6 +1889,11 @@ public class UdpNetworkClient : MonoBehaviour
         return $"{result} seq {lastFireReceiptSequence}, tick {lastFireReceiptServerTick}, {lastFireReceiptReason}";
     }
 
+    private string FormatReliableResultEventsText()
+    {
+        return $"recent {processedReliableEventIds.Count}, received {receivedReliableEventCount}, duplicate drops {duplicateReliableEventDropCount}";
+    }
+
     private string FormatSecondsAsMilliseconds(float seconds)
     {
         return $"{seconds * 1000f:F0} ms";
@@ -1912,6 +2047,57 @@ public class HealthChangedEventMessage
     public float respawnRemainingSeconds;
 }
 
+[Serializable]
+public class EventAckMessage
+{
+    public string type;
+    public long eventId;
+}
+
+[Serializable]
+public class DeathEventMessage
+{
+    public string type;
+    public long eventId;
+    public int serverTick;
+    public int playerId;
+    public int killerPlayerId;
+    public float respawnRemainingSeconds;
+}
+
+[Serializable]
+public class RespawnEventMessage
+{
+    public string type;
+    public long eventId;
+    public int serverTick;
+    public int playerId;
+    public float x;
+    public float y;
+    public float z;
+    public int health;
+    public int maxHealth;
+}
+
+[Serializable]
+public class KillEventMessage
+{
+    public string type;
+    public long eventId;
+    public int serverTick;
+    public int killerPlayerId;
+    public int victimPlayerId;
+}
+
+[Serializable]
+public class MatchEndEventMessage
+{
+    public string type;
+    public long eventId;
+    public int serverTick;
+    public int winnerPlayerId;
+}
+
 public struct BufferedLocalInput
 {
     public int InputTick;
@@ -1929,6 +2115,38 @@ public class PendingFireRequest
     public string Json;
     public float LastSentTime;
     public int ResendCount;
+}
+
+public class RecentReliableEventIds
+{
+    private readonly HashSet<long> ids = new HashSet<long>();
+    private readonly Queue<long> order = new Queue<long>();
+
+    public int Count => ids.Count;
+
+    public bool TryRecord(long eventId, int capacity)
+    {
+        if (!ids.Add(eventId))
+        {
+            return false;
+        }
+
+        order.Enqueue(eventId);
+        int safeCapacity = Mathf.Max(1, capacity);
+
+        while (order.Count > safeCapacity)
+        {
+            ids.Remove(order.Dequeue());
+        }
+
+        return true;
+    }
+
+    public void Clear()
+    {
+        ids.Clear();
+        order.Clear();
+    }
 }
 
 public struct ReconciledLocalState
