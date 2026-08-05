@@ -8,6 +8,8 @@ internal static class Program
         InputLeaseStopsMovementAfterCommandsExpire();
         InvalidAndFutureInputsAreRejectedAtTheWorldGate();
         FireCommandsResolveOnlyInsideTheServerTick();
+        DuplicateFireSequenceQueuesOnceAndReplaysTheSameReceipt();
+        InvalidFireRequestReturnsAndReplaysARejectedReceipt();
         DeadPlayersCannotQueueInputsOrFireRequests();
         PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers();
         LowPriorityEntitiesKeepTheirScopeButUseALowerStateRate();
@@ -16,7 +18,7 @@ internal static class Program
         DistanceFilteringIsTheDefaultReplicationMode();
         InactiveClientsAreRemovedFromTheRegistry();
 
-        Console.WriteLine("GameWorld command timeline and stage-11 replication checks passed.");
+        Console.WriteLine("GameWorld command timeline, reliable fire receipt, and stage-11 replication checks passed.");
     }
 
     private static void DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward()
@@ -102,6 +104,40 @@ internal static class Program
         List<GameWorldEvent> events = world.Tick(1f / 30f);
         Assert(events.OfType<FireResolvedEvent>().Any(), "Tick should resolve the queued fire command");
         Assert(world.Players.Single(player => player.PlayerId == 2).Health < world.MaxHealth, "resolved fire should apply authoritative damage");
+    }
+
+    private static void DuplicateFireSequenceQueuesOnceAndReplaysTheSameReceipt()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings { FireCooldownSeconds = 0f, AimToleranceMeters = 50f });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+
+        FireReceiptDecision firstReceipt = world.TryQueueFireWithReceipt(1, Fire(1, 1, 4f, 0f));
+        FireReceiptDecision retryReceipt = world.TryQueueFireWithReceipt(1, Fire(1, 1, 4f, 0f));
+
+        Assert(firstReceipt.Accepted, "the first valid FireRequest should receive an accepted receipt");
+        Assert(!firstReceipt.IsDuplicate, "the first receipt must not be marked as a retry");
+        Assert(retryReceipt.IsDuplicate, "the repeated fireSequence should replay a cached receipt");
+        AssertSameReceipt(firstReceipt, retryReceipt, "accepted retry receipt");
+        Assert(world.QueuedFireRequestCount == 1, "a repeated fireSequence must queue exactly one fire command");
+
+        List<GameWorldEvent> events = world.Tick(1f / 30f);
+        Assert(events.OfType<FireResolvedEvent>().Count() == 1, "one queued fire command should resolve once");
+    }
+
+    private static void InvalidFireRequestReturnsAndReplaysARejectedReceipt()
+    {
+        GameWorld world = CreateWorld();
+        Assert(world.AddPlayer(1), "player 1 should be added");
+
+        FireReceiptDecision firstReceipt = world.TryQueueFireWithReceipt(1, Fire(7, 0, 4f, 0f));
+        FireReceiptDecision retryReceipt = world.TryQueueFireWithReceipt(1, Fire(7, 0, 4f, 0f));
+
+        Assert(!firstReceipt.Accepted, "an invalid FireRequest should receive a rejected receipt");
+        Assert(firstReceipt.Reason == "invalid-fire-command", "the rejected receipt should contain the gate reason");
+        Assert(retryReceipt.IsDuplicate, "an invalid retry should replay the first rejected receipt");
+        AssertSameReceipt(firstReceipt, retryReceipt, "rejected retry receipt");
+        Assert(world.RejectedFireRequestCount == 1, "a repeated invalid fireSequence must not be rejected twice");
     }
 
     private static void PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers()
@@ -238,6 +274,14 @@ internal static class Program
     private static void AssertRejected(CommandGateResult result, string description)
     {
         Assert(!result.IsAccepted, $"Expected rejected {description}.");
+    }
+
+    private static void AssertSameReceipt(FireReceiptDecision expected, FireReceiptDecision actual, string description)
+    {
+        Assert(expected.FireSequence == actual.FireSequence, $"{description} sequence must remain stable");
+        Assert(expected.Accepted == actual.Accepted, $"{description} acceptance must remain stable");
+        Assert(expected.Reason == actual.Reason, $"{description} reason must remain stable");
+        Assert(expected.ServerTick == actual.ServerTick, $"{description} server tick must remain stable");
     }
 
     private static void Assert(bool condition, string message)

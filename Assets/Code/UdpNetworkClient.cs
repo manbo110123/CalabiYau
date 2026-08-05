@@ -48,6 +48,10 @@ public class UdpNetworkClient : MonoBehaviour
     [SerializeField] private float remoteInterpolationDelaySeconds = 0.1f;
     [SerializeField] private int remoteInterpolationBufferSize = 8;
 
+    [Header("Reliable Fire Requests")]
+    [SerializeField] private float fireReceiptTimeoutSeconds = 0.2f;
+    [SerializeField] private int maxFireRequestResends = 3;
+
     [Header("Debug")]
     [SerializeField] private bool logJsonMessages = false;
     [SerializeField] private bool logSnapshots = false;
@@ -77,6 +81,15 @@ public class UdpNetworkClient : MonoBehaviour
     private float lastLocalMovementInputTime = float.NegativeInfinity;
     private int sentFireRequestCount;
     private int nextFireSequence = 1;
+    private int resentFireRequestCount;
+    private int failedFireRequestCount;
+    private int receivedFireReceiptCount;
+    private int acceptedFireReceiptCount;
+    private int rejectedFireReceiptCount;
+    private int lastFireReceiptSequence;
+    private bool lastFireReceiptAccepted;
+    private string lastFireReceiptReason = string.Empty;
+    private int lastFireReceiptServerTick;
     private int receivedGameplayEventCount;
     private bool isLocalAlive = true;
     private int lastReceivedSnapshotTick;
@@ -105,6 +118,7 @@ public class UdpNetworkClient : MonoBehaviour
     private readonly HashSet<int> warnedMissingRemotePrefab = new HashSet<int>();
     private readonly List<BufferedLocalInput> localInputHistory = new List<BufferedLocalInput>();
     private readonly Queue<float> recentPredictionCorrectionTimes = new Queue<float>();
+    private readonly Dictionary<int, PendingFireRequest> pendingFireRequests = new Dictionary<int, PendingFireRequest>();
 
     public int PlayerId => playerId;
     public int LastAuthoritativeServerTick => lastAuthoritativeServerTick;
@@ -141,6 +155,7 @@ public class UdpNetworkClient : MonoBehaviour
     {
         ToggleDebugPanelIfRequested();
         ReceivePendingMessages();
+        RetryPendingFireRequests();
         SendInputAtNetworkTick();
     }
 
@@ -346,8 +361,69 @@ public class UdpNetworkClient : MonoBehaviour
         message.estimatedRttSeconds = GetDisplayedRttSeconds();
         message.interpolationDelaySeconds = remoteInterpolationDelaySeconds;
 
+        QueueFireRequestForReceipt(message);
+    }
+
+    private void QueueFireRequestForReceipt(FireRequestMessage message)
+    {
+        string json = JsonUtility.ToJson(message);
+        pendingFireRequests[message.fireSequence] = new PendingFireRequest
+        {
+            FireSequence = message.fireSequence,
+            OriginalRequest = message,
+            Json = json,
+            LastSentTime = Time.time,
+            ResendCount = 0
+        };
+
         sentFireRequestCount++;
-        SendJson(JsonUtility.ToJson(message));
+        SendJson(json);
+    }
+
+    private void RetryPendingFireRequests()
+    {
+        if (pendingFireRequests.Count == 0)
+        {
+            return;
+        }
+
+        float timeoutSeconds = Mathf.Max(0.01f, fireReceiptTimeoutSeconds);
+        int maximumResends = Mathf.Max(0, maxFireRequestResends);
+        List<int> completedSequences = null;
+
+        foreach (KeyValuePair<int, PendingFireRequest> pair in pendingFireRequests)
+        {
+            PendingFireRequest pending = pair.Value;
+
+            if (Time.time - pending.LastSentTime < timeoutSeconds)
+            {
+                continue;
+            }
+
+            if (pending.ResendCount >= maximumResends)
+            {
+                completedSequences ??= new List<int>();
+                completedSequences.Add(pair.Key);
+                failedFireRequestCount++;
+                Debug.LogWarning($"FireRequest receipt timed out: sequence={pair.Key}, resends={pending.ResendCount}.");
+                continue;
+            }
+
+            SendJson(pending.Json);
+            pending.LastSentTime = Time.time;
+            pending.ResendCount++;
+            resentFireRequestCount++;
+        }
+
+        if (completedSequences == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < completedSequences.Count; i++)
+        {
+            pendingFireRequests.Remove(completedSequences[i]);
+        }
     }
 
     private void SaveLocalInput(PlayerInputMessage message)
@@ -495,6 +571,10 @@ public class UdpNetworkClient : MonoBehaviour
                 HandleWorldSnapshot(json);
                 break;
 
+            case "FireReceipt":
+                HandleFireReceipt(json);
+                break;
+
             case "FireEvent":
                 HandleFireEvent(json);
                 break;
@@ -519,6 +599,7 @@ public class UdpNetworkClient : MonoBehaviour
         playerId = welcome.playerId;
         nextFireSequence = 1;
         isLocalAlive = true;
+        pendingFireRequests.Clear();
         ResetLocalPredictionState();
         ResetNetworkDebugStats();
 
@@ -542,6 +623,46 @@ public class UdpNetworkClient : MonoBehaviour
 
         RecordSnapshotStats(snapshot.serverTick, snapshot.snapshotSequence);
         ApplyWorldSnapshot(snapshot);
+    }
+
+    private void HandleFireReceipt(string json)
+    {
+        FireReceiptMessage receipt = JsonUtility.FromJson<FireReceiptMessage>(json);
+
+        if (receipt.playerId != playerId)
+        {
+            Debug.LogWarning($"FireReceipt ignored: playerId={receipt.playerId}, local playerId={playerId}.");
+            return;
+        }
+
+        if (!pendingFireRequests.Remove(receipt.fireSequence))
+        {
+            Debug.LogWarning($"FireReceipt ignored: no pending FireRequest for sequence={receipt.fireSequence}.");
+            return;
+        }
+
+        receivedFireReceiptCount++;
+        lastFireReceiptSequence = receipt.fireSequence;
+        lastFireReceiptAccepted = receipt.accepted;
+        lastFireReceiptReason = receipt.reason;
+        lastFireReceiptServerTick = receipt.serverTick;
+
+        if (receipt.accepted)
+        {
+            acceptedFireReceiptCount++;
+        }
+        else
+        {
+            rejectedFireReceiptCount++;
+        }
+
+        if (logGameplayEvents || !receipt.accepted)
+        {
+            Debug.Log(
+                $"FireReceipt serverTick={receipt.serverTick}, player={receipt.playerId}, " +
+                $"sequence={receipt.fireSequence}, accepted={receipt.accepted}, reason={receipt.reason}. " +
+                "This confirms receipt only; hit and damage still come from gameplay events.");
+        }
     }
 
     private void ApplyWorldSnapshot(WorldSnapshotMessage snapshot)
@@ -857,6 +978,15 @@ public class UdpNetworkClient : MonoBehaviour
         lastLagCompensationHitTestServerTick = 0;
         lastLagCompensationRewindSeconds = 0f;
         sentFireRequestCount = 0;
+        resentFireRequestCount = 0;
+        failedFireRequestCount = 0;
+        receivedFireReceiptCount = 0;
+        acceptedFireReceiptCount = 0;
+        rejectedFireReceiptCount = 0;
+        lastFireReceiptSequence = 0;
+        lastFireReceiptAccepted = false;
+        lastFireReceiptReason = string.Empty;
+        lastFireReceiptServerTick = 0;
         receivedGameplayEventCount = 0;
     }
 
@@ -1382,7 +1512,7 @@ public class UdpNetworkClient : MonoBehaviour
 
         EnsureDebugPanelStyles();
 
-        const int debugRowCount = 18;
+        const int debugRowCount = 20;
         const float titleHeight = 28f;
         const float rowHeight = 24f;
         const float panelPaddingHeight = 28f;
@@ -1411,6 +1541,8 @@ public class UdpNetworkClient : MonoBehaviour
         DrawDebugRow("Snapshot processing", FormatSkippedSnapshotText());
         DrawDebugRow("Replication scope", $"{lastReplicationScopePlayerCount} players, {remoteAvatars.Count} remote avatars");
         DrawDebugRow("Filtered remote cleanup", removedRemoteAvatarCount.ToString());
+        DrawDebugRow("Fire request receipts", FormatFireReceiptDeliveryText());
+        DrawDebugRow("Last fire receipt", FormatLastFireReceiptText());
         DrawDebugRow("Fire lag compensation", FormatLagCompensationText());
         DrawDebugRow("Correction budget", FormatCorrectionBudgetText());
         DrawDebugRow("Smooth correction", $"{smoothCorrectionSpeed:F1}/s, max {smoothCorrectionMaxSeconds:F2}s");
@@ -1611,6 +1743,22 @@ public class UdpNetworkClient : MonoBehaviour
         return $"{enabledText}, rewind {lastLagCompensationRewindSeconds * 1000f:F0} ms, tick {lastLagCompensationHitTestServerTick}";
     }
 
+    private string FormatFireReceiptDeliveryText()
+    {
+        return $"pending {pendingFireRequests.Count}, resend {resentFireRequestCount}, failed {failedFireRequestCount}, ack {acceptedFireReceiptCount}/{receivedFireReceiptCount}, rejected {rejectedFireReceiptCount}";
+    }
+
+    private string FormatLastFireReceiptText()
+    {
+        if (lastFireReceiptSequence <= 0)
+        {
+            return "--";
+        }
+
+        string result = lastFireReceiptAccepted ? "accepted" : "rejected";
+        return $"{result} seq {lastFireReceiptSequence}, tick {lastFireReceiptServerTick}, {lastFireReceiptReason}";
+    }
+
     private string FormatSecondsAsMilliseconds(float seconds)
     {
         return $"{seconds * 1000f:F0} ms";
@@ -1672,6 +1820,17 @@ public class FireRequestMessage
     public float aimZ;
     public float estimatedRttSeconds;
     public float interpolationDelaySeconds;
+}
+
+[Serializable]
+public class FireReceiptMessage
+{
+    public string type;
+    public int playerId;
+    public int fireSequence;
+    public bool accepted;
+    public string reason;
+    public int serverTick;
 }
 
 [Serializable]
@@ -1761,6 +1920,15 @@ public struct BufferedLocalInput
     public float AimX;
     public float AimZ;
     public float SentTime;
+}
+
+public class PendingFireRequest
+{
+    public int FireSequence;
+    public FireRequestMessage OriginalRequest;
+    public string Json;
+    public float LastSentTime;
+    public int ResendCount;
 }
 
 public struct ReconciledLocalState

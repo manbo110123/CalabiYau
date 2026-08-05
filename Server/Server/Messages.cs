@@ -73,6 +73,30 @@ public sealed class FireRequestMessage
     public float InterpolationDelaySeconds { get; set; }
 }
 
+// This confirms that the server received and made a queueing decision for a
+// FireRequest. It deliberately says nothing about hit detection or damage,
+// which are still resolved later by the authoritative GameWorld Tick.
+public sealed class FireReceiptMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+
+    [JsonPropertyName("playerId")]
+    public int PlayerId { get; set; }
+
+    [JsonPropertyName("fireSequence")]
+    public int FireSequence { get; set; }
+
+    [JsonPropertyName("accepted")]
+    public bool Accepted { get; set; }
+
+    [JsonPropertyName("reason")]
+    public string Reason { get; set; } = string.Empty;
+
+    [JsonPropertyName("serverTick")]
+    public int ServerTick { get; set; }
+}
+
 public sealed class WorldSnapshotMessage
 {
     [JsonPropertyName("type")]

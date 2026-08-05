@@ -25,6 +25,10 @@ public sealed class GameWorldSettings
     public int InputHoldTimeoutTicks { get; set; } = 6;
     public int FireBufferCapacity { get; set; } = 16;
 
+    // The client only retries a FireRequest for a short, fixed period. Keep enough receipt
+    // decisions to answer those retries without making player-owned history unbounded.
+    public int FireReceiptHistoryCapacity { get; set; } = 128;
+
     // A client may be up to one second ahead of the latest consumed input. Larger windows
     // tolerate jitter, but also retain more stale intent when the client has fallen behind.
     public int MaxInputTickAhead { get; set; } = 30;
@@ -177,47 +181,75 @@ public sealed class GameWorld
     // resolves cooldown, hit detection, damage, and events together with all other rules.
     public CommandGateResult TryQueueFire(int playerId, FireCommand command)
     {
+        FireReceiptDecision decision = TryQueueFireWithReceipt(playerId, command);
+
+        // Keep the legacy command-gate API useful to offline callers: a retry did not
+        // queue a new command. The transport uses TryQueueFireWithReceipt so it can send
+        // the original accepted/rejected receipt back to the UDP client.
+        return decision.IsDuplicate
+            ? CommandGateResult.Rejected("duplicate-or-out-of-order-fire")
+            : decision.ToCommandGateResult();
+    }
+
+    // A FireReceiptDecision represents only the server's receive/queue decision. It is
+    // remembered per sequence so a UDP retry cannot create a second queued command or
+    // change the response after world state has advanced.
+    public FireReceiptDecision TryQueueFireWithReceipt(int playerId, FireCommand command)
+    {
         ReceivedFireRequestCount++;
 
         if (!playersById.TryGetValue(playerId, out PlayerState? shooter))
         {
-            return RejectFire("unknown-player");
+            return CreateFireReceipt(command.FireSequence, RejectFire("unknown-player"));
         }
+
+        if (shooter.FireReceipts.TryGetValue(command.FireSequence, out FireReceiptDecision cachedReceipt))
+        {
+            return cachedReceipt.AsDuplicate();
+        }
+
+        CommandGateResult result;
 
         if (!shooter.IsAlive)
         {
-            return RejectFire("player-dead");
+            result = RejectFire("player-dead");
+            return RememberFireReceipt(shooter, command.FireSequence, result);
         }
 
         if (!IsValidFireCommand(command, shooter, out string rejectReason))
         {
-            return RejectFire("invalid-fire-command");
+            result = RejectFire("invalid-fire-command");
+            return RememberFireReceipt(shooter, command.FireSequence, result);
         }
 
         if (command.RequestTick < shooter.LastProcessedInputTick - settings.MaxInputTickLag)
         {
-            return RejectFire("request-too-old");
+            result = RejectFire("request-too-old");
+            return RememberFireReceipt(shooter, command.FireSequence, result);
         }
 
         if (command.RequestTick > shooter.LastProcessedInputTick + settings.MaxInputTickAhead)
         {
-            return RejectFire("request-too-far-in-future");
+            result = RejectFire("request-too-far-in-future");
+            return RememberFireReceipt(shooter, command.FireSequence, result);
         }
 
         if (command.FireSequence <= shooter.LastQueuedFireSequence)
         {
-            return RejectFire("duplicate-or-out-of-order-fire");
+            result = RejectFire("duplicate-or-out-of-order-fire");
+            return RememberFireReceipt(shooter, command.FireSequence, result);
         }
 
         if (shooter.PendingFires.Count >= settings.FireBufferCapacity)
         {
-            return RejectFire("fire-buffer-full");
+            result = RejectFire("fire-buffer-full");
+            return RememberFireReceipt(shooter, command.FireSequence, result);
         }
 
         shooter.PendingFires.Add(command.FireSequence, command);
         shooter.LastQueuedFireSequence = command.FireSequence;
         QueuedFireRequestCount++;
-        return CommandGateResult.Accepted("queued");
+        return RememberFireReceipt(shooter, command.FireSequence, CommandGateResult.Accepted("queued"));
     }
 
     public List<GameWorldEvent> Tick(float deltaTime)
@@ -629,6 +661,28 @@ public sealed class GameWorld
         return CommandGateResult.Rejected(reasonKey);
     }
 
+    private FireReceiptDecision RememberFireReceipt(PlayerState shooter, int fireSequence, CommandGateResult result)
+    {
+        FireReceiptDecision receipt = CreateFireReceipt(fireSequence, result);
+        shooter.FireReceipts.Add(fireSequence, receipt);
+        shooter.FireReceiptSequenceOrder.Enqueue(fireSequence);
+
+        int historyCapacity = Math.Max(1, settings.FireReceiptHistoryCapacity);
+
+        while (shooter.FireReceiptSequenceOrder.Count > historyCapacity)
+        {
+            int expiredSequence = shooter.FireReceiptSequenceOrder.Dequeue();
+            shooter.FireReceipts.Remove(expiredSequence);
+        }
+
+        return receipt;
+    }
+
+    private FireReceiptDecision CreateFireReceipt(int fireSequence, CommandGateResult result)
+    {
+        return new FireReceiptDecision(fireSequence, result.IsAccepted, result.Reason, ServerTick, false);
+    }
+
     private static void IncrementRejectionCount(Dictionary<string, long> counters, string reason)
     {
         counters.TryGetValue(reason, out long count);
@@ -803,6 +857,34 @@ public readonly struct FireCommand
     public float InterpolationDelaySeconds { get; }
 }
 
+public readonly struct FireReceiptDecision
+{
+    public FireReceiptDecision(int fireSequence, bool accepted, string reason, int serverTick, bool isDuplicate)
+    {
+        FireSequence = fireSequence;
+        Accepted = accepted;
+        Reason = reason;
+        ServerTick = serverTick;
+        IsDuplicate = isDuplicate;
+    }
+
+    public int FireSequence { get; }
+    public bool Accepted { get; }
+    public string Reason { get; }
+    public int ServerTick { get; }
+    public bool IsDuplicate { get; }
+
+    public FireReceiptDecision AsDuplicate()
+    {
+        return new FireReceiptDecision(FireSequence, Accepted, Reason, ServerTick, true);
+    }
+
+    public CommandGateResult ToCommandGateResult()
+    {
+        return Accepted ? CommandGateResult.Accepted(Reason) : CommandGateResult.Rejected(Reason);
+    }
+}
+
 public sealed class PlayerState
 {
     public int PlayerId { get; internal set; }
@@ -824,6 +906,8 @@ public sealed class PlayerState
     internal InputCommand LatestInput { get; set; }
     internal SortedDictionary<int, InputCommand> PendingInputs { get; } = new SortedDictionary<int, InputCommand>();
     internal SortedDictionary<int, FireCommand> PendingFires { get; } = new SortedDictionary<int, FireCommand>();
+    internal Dictionary<int, FireReceiptDecision> FireReceipts { get; } = new Dictionary<int, FireReceiptDecision>();
+    internal Queue<int> FireReceiptSequenceOrder { get; } = new Queue<int>();
     internal List<PlayerHistoryFrame> History { get; } = new List<PlayerHistoryFrame>();
 }
 

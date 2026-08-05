@@ -90,7 +90,7 @@ public sealed class UdpGameServer : IDisposable
                     break;
 
                 case "FireRequest":
-                    HandleFireRequest(received.RemoteEndPoint, json);
+                    await HandleFireRequestAsync(received.RemoteEndPoint, json);
                     break;
 
                 case "ClientGoodbye":
@@ -265,7 +265,7 @@ public sealed class UdpGameServer : IDisposable
         }
     }
 
-    private void HandleFireRequest(IPEndPoint remoteEndPoint, string json)
+    private async Task HandleFireRequestAsync(IPEndPoint remoteEndPoint, string json)
     {
         FireRequestMessage? request;
 
@@ -284,6 +284,8 @@ public sealed class UdpGameServer : IDisposable
             Console.WriteLine("FireRequest ignored: empty message.");
             return;
         }
+
+        FireReceiptMessage? receipt = null;
 
         lock (stateLock)
         {
@@ -307,15 +309,29 @@ public sealed class UdpGameServer : IDisposable
                 request.EstimatedRttSeconds,
                 request.InterpolationDelaySeconds);
 
-            CommandGateResult result = world.TryQueueFire(client.PlayerId, command);
+            FireReceiptDecision decision = world.TryQueueFireWithReceipt(client.PlayerId, command);
+            receipt = new FireReceiptMessage
+            {
+                Type = "FireReceipt",
+                PlayerId = client.PlayerId,
+                FireSequence = decision.FireSequence,
+                Accepted = decision.Accepted,
+                Reason = decision.Reason,
+                ServerTick = decision.ServerTick
+            };
 
-            if (options.LogCommandDecisions || !result.IsAccepted)
+            if (options.LogCommandDecisions || !decision.Accepted)
             {
                 Console.WriteLine(
-                    $"FireRequest {(result.IsAccepted ? "queued" : "rejected")}: " +
+                    $"FireRequest {(decision.Accepted ? "queued" : "rejected")}: " +
                     $"playerId={client.PlayerId}, sequence={command.FireSequence}, " +
-                    $"requestTick={command.RequestTick}, reason={result.Reason}.");
+                    $"requestTick={command.RequestTick}, reason={decision.Reason}, duplicate={decision.IsDuplicate}.");
             }
+        }
+
+        if (receipt != null)
+        {
+            await SendJsonAsync(receipt, remoteEndPoint);
         }
     }
 
