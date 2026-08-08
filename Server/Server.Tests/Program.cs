@@ -15,6 +15,7 @@ internal static class Program
         LowPriorityEntitiesKeepTheirScopeButUseALowerStateRate();
         FullSnapshotModePreservesTheChapterOneBaseline();
         SnapshotSequenceIsIndependentFromServerTick();
+        PerClientSnapshotsPreserveLifecycleVersion();
         DistanceFilteringIsTheDefaultReplicationMode();
         InactiveClientsAreRemovedFromTheRegistry();
         ReliableEventsResendOnlyAfterTheirInterval();
@@ -236,6 +237,22 @@ internal static class Program
 
         Assert(firstPlan.Snapshot.SnapshotSequence == 1, "first snapshot sequence should start at one");
         Assert(secondPlan.Snapshot.SnapshotSequence == 2, "every datagram needs its own sequence even at the same simulation Tick");
+    }
+
+    private static void PerClientSnapshotsPreserveLifecycleVersion()
+    {
+        GameWorld world = CreateWorldWithThreePlayers();
+        PlayerState playerTwo = world.Players.Single(player => player.PlayerId == 2);
+        playerTwo.LifeStateVersion = 7;
+
+        ClientSnapshotPlan plan = new ClientReplicator(new ClientReplicationSettings
+        {
+            EnableDistanceFiltering = false
+        }).BuildSnapshot(1, 1, 30, new SnapshotBuilder().Capture(world));
+
+        PlayerSnapshotMessage replicatedPlayerTwo = plan.Snapshot.Players.Single(player => player.PlayerId == 2);
+        Assert(replicatedPlayerTwo.LifeStateVersion == 7,
+            "per-client full snapshots must preserve lifecycle version for client-side stale-event rejection");
     }
 
     private static void ReliableEventsResendOnlyAfterTheirInterval()

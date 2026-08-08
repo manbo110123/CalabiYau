@@ -217,6 +217,7 @@ public sealed class ClientReplicator
             Health = state.Health,
             MaxHealth = state.MaxHealth,
             IsAlive = state.IsAlive,
+            LifeStateVersion = state.LifeStateVersion,
             RespawnRemainingSeconds = state.RespawnRemainingSeconds,
             ChangeMask = SnapshotChangeMasks.All
         };

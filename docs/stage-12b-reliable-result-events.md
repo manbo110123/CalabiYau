@@ -29,6 +29,75 @@
 
 `eventId` 只能回答“这一个网络事件是否见过”，不能回答“同一玩家的生命状态哪个更新”。UDP 可能先送达重生包、后送达旧死亡包；若客户端只按 `eventId` 去重，就会把已重生的 Avatar 再次切回死亡。另一个竞态是：可靠事件先到、该玩家的 `WorldSnapshot` 后到。旧实现会 ACK 并记下 `eventId`，但由于 Avatar 尚未创建而没有实际应用；重发包又会被去重，事件便永久丢失。
 
+### 问题复盘：它是什么问题、属于哪个模块
+
+这不是服务器权威结算错误，也不是单纯的“UDP 丢包”。它是**客户端把可靠传输语义、事件去重语义和 Unity Avatar 生命周期混在一起后产生的时序应用错误**。服务器给出的死亡/重生结果是正确的，但客户端收到这些结果的顺序和 Avatar 可用时间不受 UDP 保证。
+
+| 现象 | 根因 | 主要归属模块 | 修复责任 |
+| --- | --- | --- | --- |
+| 玩家已经重生，却又显示死亡 | 旧 `DeathEvent` 与新 `RespawnEvent` 的 `eventId` 不相同；去重只会拦截同一个包的重发，无法判断两个不同事件哪个生命状态更新 | Unity 客户端 `UdpNetworkClient` 的生命周期事件应用逻辑；协议缺少状态新旧依据 | 协议增加 `lifeStateVersion`；服务端维护它；客户端按玩家比较它 |
+| Avatar 未创建时收到死亡/重生，之后永远没应用 | 客户端先把 `eventId` 标为已处理并 ACK；处理函数找不到 Avatar 后直接返回；服务器收到 ACK 不再重发，后续包又被客户端去重 | Unity 客户端 `ProcessReliableEvent()`、`HandleDeathEvent()`、`HandleRespawnEvent()` 与 `GetOrCreateRemoteAvatar()` 的衔接 | 客户端 ACK 后缓存最新待应用生命周期结果，Avatar 创建后再落地 |
+| 旧 `HealthChangedEvent` 也可能把状态拉回去 | 该事件不可靠，但旧代码直接用其中的 `health/isAlive` 改 Avatar 和本地输入状态 | Unity 客户端 `HandleHealthChangedEvent()` 的职责越界 | 该事件降为观察日志；血量、存活、倒计时只读权威快照 |
+| 客户端配置 TickRate 与服务器不同，时间估算偏差 | 客户端把 `inputTickRate` 同时用于“发送输入”和“换算服务器 Tick”，两个时钟职责不同 | 协议握手与 Unity 客户端插值/调试估算逻辑 | `ServerWelcome` 下发真实 `serverTickRate`，客户端只在服务器时间轴计算中使用它 |
+
+服务端 `GameWorld` 仍是死亡、重生和血量的唯一裁决者；`ReliableEventLedger` 的职责仍是“对每个接收者有限重发直到 ACK”。它们不负责替 Unity 客户端排序，也不应知道客户端 Avatar 是否已经实例化。换言之，问题的最终落点在客户端应用层，但必须用协议字段让客户端有可比较的权威依据。
+
+### 故障时序一：不同可靠事件乱序，去重无法阻止状态倒退
+
+假设 B 初始生命版本为 1。B 死亡后，服务器产生 `DeathEvent(eventId=100, lifeStateVersion=2)`；重生后产生 `RespawnEvent(eventId=101, lifeStateVersion=3)`。它们都是正确结果，但 UDP 不保证到达顺序：
+
+```text
+服务器权威时间：  死亡 v2 / event 100  ----------------> 重生 v3 / event 101
+UDP 到达客户端：                         Respawn v3  ---> Death v2（迟到）
+旧客户端行为：                           应用重生          eventId 不重复，所以又应用死亡
+旧客户端结果：                           活着              错误地退回死亡
+```
+
+这里的关键点是：`100` 和 `101` 本来就应该各自只处理一次，因此“最近 eventId 集合”正确地允许了二者；错误在于它没有第二把尺子判断 `v2 < v3`。不能通过把 `eventId` 当作玩家生命状态版本解决，因为它是跨所有玩家的全局事件编号，且 `KillEvent` 等其他事件也会占用它。
+
+### 故障时序二：ACK 成功，但游戏状态没有成功应用
+
+```text
+1. 客户端收到 DeathEvent(eventId=100)。
+2. ProcessReliableEvent 把 100 写入最近 ID 集合。
+3. HandleDeathEvent 查询 target Avatar；此时对应 WorldSnapshot 还未到，Avatar 为 null。
+4. 旧逻辑只输出“no avatar”并返回。
+5. 客户端仍发送 EventAck(100)，服务端账本删除 100，不再重发。
+6. 后续 WorldSnapshot 到达并创建 Avatar；DeathEvent 已被 ACK 且重发包会被去重。
+7. 结果：网络层认为事件可靠送达，表现层却从未应用事件。
+```
+
+这是“**传输确认成功**”与“**业务状态已落地**”不是同一件事的问题。若改成“不创建 Avatar 就不 ACK”，服务器会在客户端看不见实体、Prefab 缺失或实体离开复制范围时持续重发；因此本阶段不延迟 ACK，而是在客户端保存足以稍后落地的权威结果。
+
+### 修复后的职责划分
+
+| 层级/模块 | 修改内容 | 为什么在这里修 |
+| --- | --- | --- |
+| `GameWorld` / `PlayerState` | 每玩家从 1 开始维护 `LifeStateVersion`，每次死亡、重生加 1 | 生命状态变化只允许由服务端权威世界产生 |
+| `SnapshotBuilder` | `PlayerSnapshot` 带 `lifeStateVersion` | 快照是状态恢复基线，必须能说明它对应哪一代生命状态 |
+| `UdpGameServer` / DTO | `DeathEvent`、`RespawnEvent`、`ServerWelcome` 序列化版本号或真实 TickRate | 协议把权威事实明确传给客户端 |
+| `ReliableEventLedger` | 保持有限 ACK/重发，不强行改造成有序通道 | 账本解决丢包补偿；它不承担跨事件排序 |
+| `UdpNetworkClient` 生命周期事件处理 | 按 `playerId + lifeStateVersion` 只应用更新状态；无 Avatar 时缓存最新一条 | Unity 表现对象何时存在，只有客户端知道 |
+| `UdpNetworkClient` 快照处理 | 记录快照版本，拒绝较旧生命状态覆盖；创建 Avatar 后尝试消费缓存 | 让快照和可靠结果使用同一套“新旧”判断 |
+| `UdpNetworkClient` 的 `HealthChangedEvent` | 只记录，不再写血量或 `isAlive` | 避免不可靠的旧提示越权覆盖权威状态 |
+
+### 修复后的处理规则
+
+客户端处理死亡或重生可靠事件时，顺序是：
+
+```text
+收到可靠事件
+-> eventId 是否在有限去重窗口内？是：仅 ACK，结束
+-> 记录 eventId，并发送 ACK
+-> 事件的 lifeStateVersion 是否大于该玩家已知版本？否：这是旧状态，丢弃
+-> Avatar 是否存在？否：按 playerId 缓存最新一条生命周期结果，结束
+-> 应用 Avatar 状态，并把该玩家已知版本更新为事件版本
+```
+
+收到快照时，先比较快照中的 `lifeStateVersion`：旧于已知版本的快照不能覆盖生命状态；同版本或更新版本可以作为权威状态恢复。随后若该快照创建了 Avatar，客户端尝试消费该玩家缓存的生命周期事件。缓存事件的版本若已经被同版本或更新快照覆盖，则安全丢弃；若更高，则立即应用。
+
+缓存按玩家只保留一条“最新的未落地死亡或重生结果”，而不是保存无限事件历史。例如尚未创建 Avatar 时先收到死亡 v2、再收到重生 v3，v3 覆盖 v2 即可，因为服务器已经以 v3 覆盖了 v2 的最终状态。
+
 ### 采用的方案
 
 每位玩家从初始值 1 开始维护 `lifeStateVersion`，每次死亡和每次重生各加 1。`DeathEvent`、`RespawnEvent` 和 `PlayerSnapshot` 都携带该值。客户端按玩家保存已知最大版本，只接受更大的生命周期事件；所以“重生版本 3 已应用后才到的死亡版本 2”会被直接丢弃。快照也携带版本，既可作为状态恢复，也能阻止旧快照覆盖已知的新生命状态。
