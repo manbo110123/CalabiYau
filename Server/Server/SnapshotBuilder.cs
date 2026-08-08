@@ -46,6 +46,7 @@ public sealed class SnapshotBuilder
             Health = player.Health,
             MaxHealth = world.MaxHealth,
             IsAlive = player.IsAlive,
+            LifeStateVersion = player.LifeStateVersion,
             RespawnRemainingSeconds = world.GetRespawnRemainingSeconds(player),
             ChangeMask = SnapshotChangeMasks.All
         };

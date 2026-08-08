@@ -21,6 +21,8 @@ internal static class Program
         AcknowledgedReliableEventsDoNotResend();
         ReliableEventsStopAfterTheirRetryLimit();
         DuplicateReliableEventIdsAreAppliedOnlyOnce();
+        ReliableEventDeduplicationIsLimitedToItsConfiguredWindow();
+        LifecycleEventsCarryPerPlayerMonotonicVersions();
         SnapshotsContinueWhileReliableEventsAwaitAcknowledgement();
 
         Console.WriteLine("GameWorld command timeline, reliable fire receipt, replication, and reliable result-event checks passed.");
@@ -290,6 +292,47 @@ internal static class Program
 
         Assert(appliedCount == 1, "the same reliable event id should be applied only once");
         Assert(received.Count == 1, "duplicate reliable ids must not grow the recent-id set");
+    }
+
+    private static void ReliableEventDeduplicationIsLimitedToItsConfiguredWindow()
+    {
+        RecentReliableEventIds received = new RecentReliableEventIds(2);
+
+        Assert(received.TryRecord(1), "the first event should be new");
+        Assert(received.TryRecord(2), "the second event should be new");
+        Assert(received.TryRecord(3), "the third event should evict the oldest entry");
+        Assert(received.Count == 2, "the recent-id set must stay at its configured capacity");
+        Assert(received.TryRecord(1), "an id outside the finite window is no longer deduplicated");
+    }
+
+    private static void LifecycleEventsCarryPerPlayerMonotonicVersions()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings
+        {
+            FireDamage = 100,
+            FireCooldownSeconds = 0f,
+            RespawnDelaySeconds = 1f / 30f,
+            AimToleranceMeters = 50f
+        });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+
+        AssertAccepted(world.TryQueueFire(1, Fire(1, 1, 4f, 0f)), "killing fire request");
+        List<GameWorldEvent> deathTickEvents = world.Tick(1f / 30f);
+        DeathWorldEvent death = deathTickEvents.OfType<DeathWorldEvent>().Single();
+        PlayerState victim = world.Players.Single(player => player.PlayerId == 2);
+
+        Assert(death.LifeStateVersion == 2, "death must advance the victim life-state version");
+        Assert(victim.LifeStateVersion == death.LifeStateVersion, "death event and authority state must agree");
+
+        List<GameWorldEvent> respawnTickEvents = world.Tick(1f / 30f);
+        RespawnWorldEvent respawn = respawnTickEvents.OfType<RespawnWorldEvent>().Single();
+
+        Assert(respawn.LifeStateVersion == 3, "respawn must advance the same player's version again");
+        Assert(respawn.LifeStateVersion > death.LifeStateVersion, "later lifecycle results must be strictly newer");
+
+        PlayerSnapshotMessage snapshot = new SnapshotBuilder().Build(world).Players.Single(player => player.PlayerId == 2);
+        Assert(snapshot.LifeStateVersion == respawn.LifeStateVersion, "snapshots must carry the latest lifecycle version as recovery state");
     }
 
     private static void SnapshotsContinueWhileReliableEventsAwaitAcknowledgement()

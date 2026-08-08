@@ -67,6 +67,9 @@ public class UdpNetworkClient : MonoBehaviour
 
     private UdpClient udpClient;
     private int playerId;
+    // The local input send rate remains configurable. This value is only for time
+    // calculations expressed on the authoritative server's Tick timeline.
+    private float serverTickRate = 30f;
     private int inputTick;
     private float inputTimer;
     private bool hasAppliedInitialLocalServerSnapshot;
@@ -96,6 +99,7 @@ public class UdpNetworkClient : MonoBehaviour
     private int receivedGameplayEventCount;
     private int receivedReliableEventCount;
     private int duplicateReliableEventDropCount;
+    private int discardedStaleLifecycleEventCount;
     private bool isLocalAlive = true;
     private int lastReceivedSnapshotTick;
     private uint lastReceivedSnapshotSequence;
@@ -125,6 +129,10 @@ public class UdpNetworkClient : MonoBehaviour
     private readonly Queue<float> recentPredictionCorrectionTimes = new Queue<float>();
     private readonly Dictionary<int, PendingFireRequest> pendingFireRequests = new Dictionary<int, PendingFireRequest>();
     private readonly RecentReliableEventIds processedReliableEventIds = new RecentReliableEventIds();
+    private readonly Dictionary<int, int> latestLifeStateVersionByPlayer = new Dictionary<int, int>();
+    // One player can only have one newest unapplied life state. A newer death or respawn
+    // replaces an older cached result because it already supersedes it on the server.
+    private readonly Dictionary<int, PendingLifecycleEvent> pendingLifecycleEventsByPlayer = new Dictionary<int, PendingLifecycleEvent>();
 
     public int PlayerId => playerId;
     public int LastAuthoritativeServerTick => lastAuthoritativeServerTick;
@@ -619,6 +627,7 @@ public class UdpNetworkClient : MonoBehaviour
     {
         ServerWelcomeMessage welcome = JsonUtility.FromJson<ServerWelcomeMessage>(json);
         playerId = welcome.playerId;
+        serverTickRate = welcome.serverTickRate > 0 ? welcome.serverTickRate : Mathf.Max(1f, inputTickRate);
         nextFireSequence = 1;
         isLocalAlive = true;
         pendingFireRequests.Clear();
@@ -631,7 +640,7 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         ApplyNetworkControlMode();
-        Debug.Log($"Connected to server. playerId={playerId}, message={welcome.message}");
+        Debug.Log($"Connected to server. playerId={playerId}, serverTickRate={serverTickRate:F0} Hz, message={welcome.message}");
     }
 
     private void HandleWorldSnapshot(string json)
@@ -768,28 +777,13 @@ public class UdpNetworkClient : MonoBehaviour
         HealthChangedEventMessage healthEvent = JsonUtility.FromJson<HealthChangedEventMessage>(json);
         receivedGameplayEventCount++;
 
-        NetworkTankAvatar avatar = GetAvatarByPlayerId(healthEvent.playerId);
-
-        if (avatar == null)
-        {
-            Debug.LogWarning($"HealthChangedEvent ignored: no avatar for playerId={healthEvent.playerId}.");
-            return;
-        }
-
-        avatar.ApplyNetworkHealth(healthEvent.health, healthEvent.maxHealth, healthEvent.isAlive);
-        avatar.SetRespawnRemainingSeconds(healthEvent.respawnRemainingSeconds);
-
-        if (healthEvent.playerId == playerId)
-        {
-            SetLocalAliveFromServer(healthEvent.isAlive, null, healthEvent.serverTick);
-        }
-
         if (logGameplayEvents)
         {
             Debug.Log(
                 $"HealthChangedEvent serverTick={healthEvent.serverTick}, player={healthEvent.playerId}, " +
                 $"health={healthEvent.health}/{healthEvent.maxHealth}, alive={healthEvent.isAlive}, " +
-                $"respawnIn={healthEvent.respawnRemainingSeconds:F1}s");
+                $"respawnIn={healthEvent.respawnRemainingSeconds:F1}s. " +
+                "This unreliable event does not change client health; WorldSnapshot is authoritative.");
         }
     }
 
@@ -799,23 +793,7 @@ public class UdpNetworkClient : MonoBehaviour
         ProcessReliableEvent(deathEvent.eventId, () =>
         {
             receivedGameplayEventCount++;
-            NetworkTankAvatar avatar = GetAvatarByPlayerId(deathEvent.playerId);
-
-            if (avatar != null)
-            {
-                avatar.ApplyNetworkHealth(0, avatar.MaxHealth, false);
-                avatar.SetRespawnRemainingSeconds(deathEvent.respawnRemainingSeconds);
-            }
-
-            if (deathEvent.playerId == playerId)
-            {
-                SetLocalAliveFromServer(false, null, deathEvent.serverTick);
-            }
-
-            if (logGameplayEvents)
-            {
-                Debug.Log($"DeathEvent eventId={deathEvent.eventId}, tick={deathEvent.serverTick}, player={deathEvent.playerId}, killer={deathEvent.killerPlayerId}.");
-            }
+            ApplyOrCacheDeathEvent(deathEvent);
         });
     }
 
@@ -825,23 +803,7 @@ public class UdpNetworkClient : MonoBehaviour
         ProcessReliableEvent(respawnEvent.eventId, () =>
         {
             receivedGameplayEventCount++;
-            NetworkTankAvatar avatar = GetAvatarByPlayerId(respawnEvent.playerId);
-
-            if (avatar != null)
-            {
-                avatar.ApplyNetworkHealth(respawnEvent.health, respawnEvent.maxHealth, true);
-                avatar.SetRespawnRemainingSeconds(0f);
-            }
-
-            if (respawnEvent.playerId == playerId)
-            {
-                SetLocalAliveFromServer(true, null, respawnEvent.serverTick);
-            }
-
-            if (logGameplayEvents)
-            {
-                Debug.Log($"RespawnEvent eventId={respawnEvent.eventId}, tick={respawnEvent.serverTick}, player={respawnEvent.playerId}.");
-            }
+            ApplyOrCacheRespawnEvent(respawnEvent);
         });
     }
 
@@ -889,6 +851,154 @@ public class UdpNetworkClient : MonoBehaviour
         SendEventAck(eventId);
     }
 
+    private void ApplyOrCacheDeathEvent(DeathEventMessage deathEvent)
+    {
+        if (!ShouldApplyLifecycleVersion(deathEvent.playerId, deathEvent.lifeStateVersion))
+        {
+            discardedStaleLifecycleEventCount++;
+            return;
+        }
+
+        NetworkTankAvatar avatar = GetAvatarByPlayerId(deathEvent.playerId);
+
+        if (avatar == null)
+        {
+            CachePendingLifecycleEvent(PendingLifecycleEvent.FromDeath(deathEvent));
+            return;
+        }
+
+        ApplyDeathEventToAvatar(deathEvent, avatar);
+    }
+
+    private void ApplyOrCacheRespawnEvent(RespawnEventMessage respawnEvent)
+    {
+        if (!ShouldApplyLifecycleVersion(respawnEvent.playerId, respawnEvent.lifeStateVersion))
+        {
+            discardedStaleLifecycleEventCount++;
+            return;
+        }
+
+        NetworkTankAvatar avatar = GetAvatarByPlayerId(respawnEvent.playerId);
+
+        if (avatar == null)
+        {
+            CachePendingLifecycleEvent(PendingLifecycleEvent.FromRespawn(respawnEvent));
+            return;
+        }
+
+        ApplyRespawnEventToAvatar(respawnEvent, avatar);
+    }
+
+    private void ApplyDeathEventToAvatar(DeathEventMessage deathEvent, NetworkTankAvatar avatar)
+    {
+        RecordLifecycleVersion(deathEvent.playerId, deathEvent.lifeStateVersion);
+        avatar.ApplyNetworkHealth(0, avatar.MaxHealth, false);
+        avatar.SetRespawnRemainingSeconds(deathEvent.respawnRemainingSeconds);
+
+        if (deathEvent.playerId == playerId)
+        {
+            SetLocalAliveFromServer(false, null, deathEvent.serverTick);
+        }
+
+        if (logGameplayEvents)
+        {
+            Debug.Log($"DeathEvent eventId={deathEvent.eventId}, tick={deathEvent.serverTick}, player={deathEvent.playerId}, lifeVersion={deathEvent.lifeStateVersion}, killer={deathEvent.killerPlayerId}.");
+        }
+    }
+
+    private void ApplyRespawnEventToAvatar(RespawnEventMessage respawnEvent, NetworkTankAvatar avatar)
+    {
+        RecordLifecycleVersion(respawnEvent.playerId, respawnEvent.lifeStateVersion);
+        avatar.ApplyNetworkHealth(respawnEvent.health, respawnEvent.maxHealth, true);
+        avatar.SetRespawnRemainingSeconds(0f);
+
+        if (respawnEvent.playerId == playerId)
+        {
+            SetLocalAliveFromServer(true, null, respawnEvent.serverTick);
+        }
+
+        if (logGameplayEvents)
+        {
+            Debug.Log($"RespawnEvent eventId={respawnEvent.eventId}, tick={respawnEvent.serverTick}, player={respawnEvent.playerId}, lifeVersion={respawnEvent.lifeStateVersion}.");
+        }
+    }
+
+    private void CachePendingLifecycleEvent(PendingLifecycleEvent pendingEvent)
+    {
+        if (pendingLifecycleEventsByPlayer.TryGetValue(pendingEvent.PlayerId, out PendingLifecycleEvent existing)
+            && existing.LifeStateVersion >= pendingEvent.LifeStateVersion)
+        {
+            return;
+        }
+
+        pendingLifecycleEventsByPlayer[pendingEvent.PlayerId] = pendingEvent;
+
+        if (logGameplayEvents)
+        {
+            Debug.Log($"Cached reliable {pendingEvent.EventType} for player={pendingEvent.PlayerId}, lifeVersion={pendingEvent.LifeStateVersion}: Avatar is not available yet.");
+        }
+    }
+
+    private void ApplyPendingLifecycleEventIfReady(int targetPlayerId, NetworkTankAvatar avatar)
+    {
+        if (avatar == null || !pendingLifecycleEventsByPlayer.TryGetValue(targetPlayerId, out PendingLifecycleEvent pendingEvent))
+        {
+            return;
+        }
+
+        pendingLifecycleEventsByPlayer.Remove(targetPlayerId);
+
+        if (!ShouldApplyLifecycleVersion(targetPlayerId, pendingEvent.LifeStateVersion))
+        {
+            return;
+        }
+
+        if (pendingEvent.IsRespawn)
+        {
+            ApplyRespawnEventToAvatar(pendingEvent.RespawnEvent, avatar);
+            return;
+        }
+
+        ApplyDeathEventToAvatar(pendingEvent.DeathEvent, avatar);
+    }
+
+    private bool ShouldApplyLifecycleVersion(int targetPlayerId, int lifeStateVersion)
+    {
+        if (lifeStateVersion <= 0)
+        {
+            // This keeps an old client/server pair usable during local protocol upgrades.
+            return true;
+        }
+
+        return !latestLifeStateVersionByPlayer.TryGetValue(targetPlayerId, out int latestVersion)
+            || lifeStateVersion > latestVersion;
+    }
+
+    private bool ObserveSnapshotLifecycleVersion(int targetPlayerId, int lifeStateVersion)
+    {
+        if (lifeStateVersion <= 0)
+        {
+            return true;
+        }
+
+        if (latestLifeStateVersionByPlayer.TryGetValue(targetPlayerId, out int latestVersion)
+            && lifeStateVersion < latestVersion)
+        {
+            return false;
+        }
+
+        latestLifeStateVersionByPlayer[targetPlayerId] = lifeStateVersion;
+        return true;
+    }
+
+    private void RecordLifecycleVersion(int targetPlayerId, int lifeStateVersion)
+    {
+        if (lifeStateVersion > 0)
+        {
+            latestLifeStateVersionByPlayer[targetPlayerId] = lifeStateVersion;
+        }
+    }
+
     private void SendEventAck(long eventId)
     {
         EventAckMessage acknowledgement = new EventAckMessage();
@@ -912,7 +1022,14 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
-        ApplySnapshotHealth(remoteAvatar, snapshot);
+        bool isCurrentLifecycleSnapshot = ObserveSnapshotLifecycleVersion(snapshot.playerId, snapshot.lifeStateVersion);
+
+        if (isCurrentLifecycleSnapshot)
+        {
+            ApplySnapshotHealth(remoteAvatar, snapshot);
+        }
+
+        ApplyPendingLifecycleEventIfReady(snapshot.playerId, remoteAvatar);
 
         if (interpolateRemotePlayers)
         {
@@ -938,16 +1055,22 @@ public class UdpNetworkClient : MonoBehaviour
 
     private void ApplyLocalSnapshot(int serverTick, PlayerSnapshotMessage snapshot)
     {
-        ApplySnapshotHealth(localAvatar, snapshot);
+        bool isCurrentLifecycleSnapshot = ObserveSnapshotLifecycleVersion(snapshot.playerId, snapshot.lifeStateVersion);
 
-        if (!snapshot.isAlive)
+        if (isCurrentLifecycleSnapshot)
+        {
+            ApplySnapshotHealth(localAvatar, snapshot);
+            ApplyPendingLifecycleEventIfReady(snapshot.playerId, localAvatar);
+        }
+
+        if (isCurrentLifecycleSnapshot && !snapshot.isAlive)
         {
             SetLocalAliveFromServer(false, snapshot, serverTick);
             StoreAuthoritativeLocalSnapshot(serverTick, snapshot);
             ApplyLocalSnapshotToTransform(snapshot);
             return;
         }
-        else if (!isLocalAlive)
+        else if (isCurrentLifecycleSnapshot && !isLocalAlive)
         {
             SetLocalAliveFromServer(true, snapshot, serverTick);
             return;
@@ -1116,7 +1239,10 @@ public class UdpNetworkClient : MonoBehaviour
         receivedGameplayEventCount = 0;
         receivedReliableEventCount = 0;
         duplicateReliableEventDropCount = 0;
+        discardedStaleLifecycleEventCount = 0;
         processedReliableEventIds.Clear();
+        latestLifeStateVersionByPlayer.Clear();
+        pendingLifecycleEventsByPlayer.Clear();
     }
 
     private void RecordSnapshotStats(int serverTick, uint snapshotSequence)
@@ -1517,7 +1643,7 @@ public class UdpNetworkClient : MonoBehaviour
         avatar.SetRemoteInterpolation(
             interpolateRemotePlayers,
             GetRemoteInterpolationDelayTicks(),
-            Mathf.Max(1f, inputTickRate),
+            serverTickRate,
             remoteInterpolationBufferSize);
         remoteAvatars.Add(snapshot.playerId, avatar);
         return avatar;
@@ -1598,7 +1724,7 @@ public class UdpNetworkClient : MonoBehaviour
 
     private int GetRemoteInterpolationDelayTicks()
     {
-        float safeTickRate = Mathf.Max(1f, inputTickRate);
+        float safeTickRate = Mathf.Max(1f, serverTickRate);
         return Mathf.Max(1, Mathf.RoundToInt(remoteInterpolationDelaySeconds * safeTickRate));
     }
 
@@ -1779,7 +1905,7 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         float secondsSinceSnapshot = Mathf.Max(0f, Time.time - lastSnapshotReceivedTime);
-        int ticksSinceSnapshot = Mathf.RoundToInt(secondsSinceSnapshot * Mathf.Max(1f, inputTickRate));
+        int ticksSinceSnapshot = Mathf.RoundToInt(secondsSinceSnapshot * Mathf.Max(1f, serverTickRate));
         return lastReceivedSnapshotTick + ticksSinceSnapshot;
     }
 
@@ -1891,7 +2017,7 @@ public class UdpNetworkClient : MonoBehaviour
 
     private string FormatReliableResultEventsText()
     {
-        return $"recent {processedReliableEventIds.Count}, received {receivedReliableEventCount}, duplicate drops {duplicateReliableEventDropCount}";
+        return $"recent {processedReliableEventIds.Count}, received {receivedReliableEventCount}, duplicate drops {duplicateReliableEventDropCount}, stale life drops {discardedStaleLifecycleEventCount}, pending life {pendingLifecycleEventsByPlayer.Count}";
     }
 
     private string FormatSecondsAsMilliseconds(float seconds)
@@ -1929,6 +2055,7 @@ public class ServerWelcomeMessage
 {
     public string type;
     public int playerId;
+    public int serverTickRate;
     public string message;
 }
 
@@ -1999,6 +2126,7 @@ public class PlayerSnapshotMessage
     public int health;
     public int maxHealth;
     public bool isAlive;
+    public int lifeStateVersion;
     public float respawnRemainingSeconds;
     public uint changeMask;
 }
@@ -2061,6 +2189,7 @@ public class DeathEventMessage
     public long eventId;
     public int serverTick;
     public int playerId;
+    public int lifeStateVersion;
     public int killerPlayerId;
     public float respawnRemainingSeconds;
 }
@@ -2072,6 +2201,7 @@ public class RespawnEventMessage
     public long eventId;
     public int serverTick;
     public int playerId;
+    public int lifeStateVersion;
     public float x;
     public float y;
     public float z;
@@ -2115,6 +2245,37 @@ public class PendingFireRequest
     public string Json;
     public float LastSentTime;
     public int ResendCount;
+}
+
+public class PendingLifecycleEvent
+{
+    public int PlayerId;
+    public int LifeStateVersion;
+    public bool IsRespawn;
+    public DeathEventMessage DeathEvent;
+    public RespawnEventMessage RespawnEvent;
+    public string EventType => IsRespawn ? "RespawnEvent" : "DeathEvent";
+
+    public static PendingLifecycleEvent FromDeath(DeathEventMessage deathEvent)
+    {
+        return new PendingLifecycleEvent
+        {
+            PlayerId = deathEvent.playerId,
+            LifeStateVersion = deathEvent.lifeStateVersion,
+            DeathEvent = deathEvent
+        };
+    }
+
+    public static PendingLifecycleEvent FromRespawn(RespawnEventMessage respawnEvent)
+    {
+        return new PendingLifecycleEvent
+        {
+            PlayerId = respawnEvent.playerId,
+            LifeStateVersion = respawnEvent.lifeStateVersion,
+            IsRespawn = true,
+            RespawnEvent = respawnEvent
+        };
+    }
 }
 
 public class RecentReliableEventIds

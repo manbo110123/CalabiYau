@@ -19,6 +19,11 @@ public sealed class ServerWelcomeMessage
 
     [JsonPropertyName("message")]
     public string Message { get; set; } = string.Empty;
+
+    // The client uses this for calculations expressed in server ticks, such as
+    // remote interpolation and estimating the current server Tick.
+    [JsonPropertyName("serverTickRate")]
+    public int ServerTickRate { get; set; }
 }
 
 public sealed class PlayerInputMessage
@@ -164,6 +169,11 @@ public sealed class PlayerSnapshotMessage
     [JsonPropertyName("isAlive")]
     public bool IsAlive { get; set; }
 
+    // Increments only when this player's life state changes (death or respawn).
+    // It lets a client reject a delayed lifecycle event even when UDP reorders it.
+    [JsonPropertyName("lifeStateVersion")]
+    public int LifeStateVersion { get; set; }
+
     [JsonPropertyName("respawnRemainingSeconds")]
     public float RespawnRemainingSeconds { get; set; }
 
@@ -300,6 +310,8 @@ public sealed class DeathEventMessage
     public int ServerTick { get; set; }
     [JsonPropertyName("playerId")]
     public int PlayerId { get; set; }
+    [JsonPropertyName("lifeStateVersion")]
+    public int LifeStateVersion { get; set; }
     [JsonPropertyName("killerPlayerId")]
     public int KillerPlayerId { get; set; }
     [JsonPropertyName("respawnRemainingSeconds")]
@@ -316,6 +328,8 @@ public sealed class RespawnEventMessage
     public int ServerTick { get; set; }
     [JsonPropertyName("playerId")]
     public int PlayerId { get; set; }
+    [JsonPropertyName("lifeStateVersion")]
+    public int LifeStateVersion { get; set; }
     [JsonPropertyName("x")]
     public float X { get; set; }
     [JsonPropertyName("y")]

@@ -268,6 +268,7 @@ public sealed class UdpGameServer : IDisposable
         {
             Type = "ServerWelcome",
             PlayerId = registration.Client.PlayerId,
+            ServerTickRate = options.TickRate,
             Message = "Welcome to the UDP demo server."
         };
 
@@ -576,6 +577,7 @@ public sealed class UdpGameServer : IDisposable
                     Type = "DeathEvent",
                     ServerTick = deathEvent.ServerTick,
                     PlayerId = deathEvent.PlayerId,
+                    LifeStateVersion = deathEvent.LifeStateVersion,
                     KillerPlayerId = deathEvent.KillerPlayerId,
                     RespawnRemainingSeconds = deathEvent.RespawnRemainingSeconds
                 };
@@ -586,6 +588,7 @@ public sealed class UdpGameServer : IDisposable
                     Type = "RespawnEvent",
                     ServerTick = respawnEvent.ServerTick,
                     PlayerId = respawnEvent.PlayerId,
+                    LifeStateVersion = respawnEvent.LifeStateVersion,
                     X = respawnEvent.X,
                     Y = respawnEvent.Y,
                     Z = respawnEvent.Z,

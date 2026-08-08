@@ -373,6 +373,7 @@ public sealed class GameWorld
                     {
                         ServerTick = ServerTick,
                         PlayerId = hitPlayer.PlayerId,
+                        LifeStateVersion = hitPlayer.LifeStateVersion,
                         KillerPlayerId = shooter.PlayerId,
                         RespawnRemainingSeconds = GetRespawnRemainingSeconds(hitPlayer)
                     });
@@ -415,6 +416,7 @@ public sealed class GameWorld
             AimZ = 5f,
             Health = settings.MaxHealth,
             IsAlive = true,
+            LifeStateVersion = 1,
             NextAllowedFireServerTick = 0,
             RespawnServerTick = 0,
             LatestInput = new InputCommand(0, 0f, 0f, spawnX, 5f)
@@ -451,6 +453,7 @@ public sealed class GameWorld
     {
         player.IsAlive = false;
         player.Health = 0;
+        player.LifeStateVersion++;
         player.RespawnServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(settings.RespawnDelaySeconds * settings.ServerTickRate));
         player.NextAllowedFireServerTick = player.RespawnServerTick;
         player.LatestInput = new InputCommand(
@@ -480,6 +483,7 @@ public sealed class GameWorld
         player.AimZ = 5f;
         player.Health = settings.MaxHealth;
         player.IsAlive = true;
+        player.LifeStateVersion++;
         player.RespawnServerTick = 0;
         player.NextAllowedFireServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(0.25f * settings.ServerTickRate));
         player.LatestInput = new InputCommand(player.LatestInput.InputTick, 0f, 0f, spawnX, 5f);
@@ -494,6 +498,7 @@ public sealed class GameWorld
             {
                 ServerTick = ServerTick,
                 PlayerId = player.PlayerId,
+                LifeStateVersion = player.LifeStateVersion,
                 X = player.X,
                 Y = player.Y,
                 Z = player.Z,
@@ -927,6 +932,7 @@ public sealed class PlayerState
     public int LastProcessedInputTick { get; internal set; }
     public int Health { get; internal set; }
     public bool IsAlive { get; internal set; }
+    public int LifeStateVersion { get; internal set; }
     public int LastCombatServerTick { get; internal set; }
     internal int NextAllowedFireServerTick { get; set; }
     internal int RespawnServerTick { get; set; }
@@ -984,6 +990,7 @@ public sealed class HealthChangedWorldEvent : GameWorldEvent
 public sealed class DeathWorldEvent : GameWorldEvent
 {
     public int PlayerId { get; init; }
+    public int LifeStateVersion { get; init; }
     public int KillerPlayerId { get; init; }
     public float RespawnRemainingSeconds { get; init; }
 }
@@ -991,6 +998,7 @@ public sealed class DeathWorldEvent : GameWorldEvent
 public sealed class RespawnWorldEvent : GameWorldEvent
 {
     public int PlayerId { get; init; }
+    public int LifeStateVersion { get; init; }
     public float X { get; init; }
     public float Y { get; init; }
     public float Z { get; init; }
