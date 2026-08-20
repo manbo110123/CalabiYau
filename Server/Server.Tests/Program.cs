@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 
 internal static class Program
 {
@@ -10,6 +11,10 @@ internal static class Program
         FireCommandsResolveOnlyInsideTheServerTick();
         DuplicateFireSequenceQueuesOnceAndReplaysTheSameReceipt();
         InvalidFireRequestReturnsAndReplaysARejectedReceipt();
+        QueuedFireRequestsProduceExactlyOneFinalResult();
+        FireResultReportsAHitTargetOnlyForAnActualHit();
+        FireResultJsonOmitsTargetForNoHitOrRejection();
+        AQueuedFireKilledBeforeItsTurnStillProducesOneFinalResult();
         DeadPlayersCannotQueueInputsOrFireRequests();
         PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers();
         LowPriorityEntitiesKeepTheirScopeButUseALowerStateRate();
@@ -146,6 +151,91 @@ internal static class Program
         Assert(retryReceipt.IsDuplicate, "an invalid retry should replay the first rejected receipt");
         AssertSameReceipt(firstReceipt, retryReceipt, "rejected retry receipt");
         Assert(world.RejectedFireRequestCount == 1, "a repeated invalid fireSequence must not be rejected twice");
+    }
+
+    private static void QueuedFireRequestsProduceExactlyOneFinalResult()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings
+        {
+            FireCooldownSeconds = 1f,
+            AimToleranceMeters = 50f
+        });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+
+        Assert(world.TryQueueFireWithReceipt(1, Fire(1, 1, 0f, 10f)).Accepted, "first no-hit request should queue");
+        Assert(world.TryQueueFireWithReceipt(1, Fire(2, 1, 0f, 10f)).Accepted, "second request should queue before Tick cooldown resolution");
+
+        List<FireResultWorldEvent> results = world.Tick(1f / 30f).OfType<FireResultWorldEvent>().ToList();
+
+        Assert(results.Count == 2, "every queued fireSequence must produce one final result");
+        AssertFireResult(results.Single(result => result.FireSequence == 1), "fired-no-hit", 0, "first queued fire");
+        AssertFireResult(results.Single(result => result.FireSequence == 2), "rejected-cooldown", 0, "cooldown-rejected fire");
+    }
+
+    private static void FireResultReportsAHitTargetOnlyForAnActualHit()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings
+        {
+            FireCooldownSeconds = 0f,
+            AimToleranceMeters = 50f
+        });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+
+        Assert(world.TryQueueFireWithReceipt(1, Fire(1, 1, 4f, 0f)).Accepted, "hit request should queue");
+
+        FireResultWorldEvent result = world.Tick(1f / 30f).OfType<FireResultWorldEvent>().Single();
+        AssertFireResult(result, "fired-hit", 2, "hit fire");
+    }
+
+    private static void FireResultJsonOmitsTargetForNoHitOrRejection()
+    {
+        FireResultMessage noHit = new FireResultMessage
+        {
+            Type = "FireResult",
+            EventId = 1,
+            ServerTick = 10,
+            PlayerId = 1,
+            FireSequence = 1,
+            Result = "fired-no-hit"
+        };
+        FireResultMessage hit = new FireResultMessage
+        {
+            Type = "FireResult",
+            EventId = 2,
+            ServerTick = 10,
+            PlayerId = 1,
+            FireSequence = 2,
+            Result = "fired-hit",
+            TargetPlayerId = 2
+        };
+
+        Assert(!JsonSerializer.Serialize(noHit).Contains("targetPlayerId"),
+            "no-hit FireResult should not carry unnecessary target information");
+        Assert(JsonSerializer.Serialize(hit).Contains("targetPlayerId"),
+            "hit FireResult must carry its target player id");
+    }
+
+    private static void AQueuedFireKilledBeforeItsTurnStillProducesOneFinalResult()
+    {
+        GameWorld world = new GameWorld(new GameWorldSettings
+        {
+            FireDamage = 100,
+            FireCooldownSeconds = 0f,
+            AimToleranceMeters = 50f
+        });
+        Assert(world.AddPlayer(1), "player 1 should be added");
+        Assert(world.AddPlayer(2), "player 2 should be added");
+
+        Assert(world.TryQueueFireWithReceipt(1, Fire(1, 1, 4f, 0f)).Accepted, "player 1 killing fire should queue");
+        Assert(world.TryQueueFireWithReceipt(2, Fire(1, 1, 0f, 0f)).Accepted, "player 2 fire should queue before being killed");
+
+        List<FireResultWorldEvent> results = world.Tick(1f / 30f).OfType<FireResultWorldEvent>().ToList();
+
+        Assert(results.Count == 2, "a fire queued before death must not disappear without a result");
+        AssertFireResult(results.Single(result => result.ShooterPlayerId == 1), "fired-hit", 2, "killer result");
+        AssertFireResult(results.Single(result => result.ShooterPlayerId == 2), "rejected-player-dead", 0, "dead shooter's result");
     }
 
     private static void PerClientReplicationAlwaysSendsSelfAndFiltersOutOfRangePlayers()
@@ -419,6 +509,14 @@ internal static class Program
         Assert(expected.Accepted == actual.Accepted, $"{description} acceptance must remain stable");
         Assert(expected.Reason == actual.Reason, $"{description} reason must remain stable");
         Assert(expected.ServerTick == actual.ServerTick, $"{description} server tick must remain stable");
+    }
+
+    private static void AssertFireResult(FireResultWorldEvent result, string expectedResult, int expectedTargetPlayerId, string description)
+    {
+        Assert(result.ServerTick > 0, $"{description} must carry the authoritative resolution Tick");
+        Assert(result.Result == expectedResult, $"{description} should be '{expectedResult}', got '{result.Result}'");
+        Assert(result.TargetPlayerId == expectedTargetPlayerId,
+            $"{description} target should be {expectedTargetPlayerId}, got {result.TargetPlayerId}");
     }
 
     private static void Assert(bool condition, string message)

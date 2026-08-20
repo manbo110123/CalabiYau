@@ -293,12 +293,14 @@ public sealed class GameWorld
             if (!shooter.IsAlive)
             {
                 RejectFire("player-dead");
+                AddFireResult(eventsToBroadcast, shooter.PlayerId, command.FireSequence, "rejected-player-dead");
                 continue;
             }
 
             if (ServerTick < shooter.NextAllowedFireServerTick)
             {
                 RejectFire("cooldown");
+                AddFireResult(eventsToBroadcast, shooter.PlayerId, command.FireSequence, "rejected-cooldown");
                 continue;
             }
 
@@ -308,6 +310,7 @@ public sealed class GameWorld
                 && !IsRequestedAimReasonable(shooterFrame.AimX, shooterFrame.AimZ, command))
             {
                 RejectFire("aim-mismatch");
+                AddFireResult(eventsToBroadcast, shooter.PlayerId, command.FireSequence, "rejected-aim-mismatch");
                 continue;
             }
 
@@ -323,10 +326,18 @@ public sealed class GameWorld
             FireRay fireRay = BuildFireRay(shooterFrame.X, shooterFrame.Z, shooterFrame.BodyYaw, command);
             int hitPlayerId = FindFirstHitPlayer(shooter.PlayerId, fireRay, shooterFrame.HitTestServerTick, out float hitDistance);
 
+            AddFireResult(
+                eventsToBroadcast,
+                shooter.PlayerId,
+                command.FireSequence,
+                hitPlayerId != 0 ? "fired-hit" : "fired-no-hit",
+                hitPlayerId);
+
             eventsToBroadcast.Add(new FireResolvedEvent
             {
                 ServerTick = ServerTick,
                 ShooterPlayerId = shooter.PlayerId,
+                FireSequence = command.FireSequence,
                 RequestTick = command.RequestTick,
                 OriginX = fireRay.OriginX,
                 OriginY = fireRay.OriginY,
@@ -388,6 +399,26 @@ public sealed class GameWorld
         }
 
         shooter.PendingFires.Clear();
+    }
+
+    // Every command which received an accepted FireReceipt reaches this point exactly once.
+    // The result is deliberately separate from FireResolvedEvent/HitResolvedEvent: those
+    // remain ordinary presentation events, while this is the shooter's reliable final answer.
+    private void AddFireResult(
+        List<GameWorldEvent> eventsToBroadcast,
+        int shooterPlayerId,
+        int fireSequence,
+        string result,
+        int targetPlayerId = 0)
+    {
+        eventsToBroadcast.Add(new FireResultWorldEvent
+        {
+            ServerTick = ServerTick,
+            ShooterPlayerId = shooterPlayerId,
+            FireSequence = fireSequence,
+            Result = result,
+            TargetPlayerId = targetPlayerId
+        });
     }
 
     public float GetRespawnRemainingSeconds(PlayerState player)
@@ -463,7 +494,8 @@ public sealed class GameWorld
             player.LatestInput.AimX,
             player.LatestInput.AimZ);
         player.PendingInputs.Clear();
-        player.PendingFires.Clear();
+        // Keep already accepted FireRequests until this Tick reaches their resolver. They
+        // will become rejected-player-dead FireResults rather than silently disappearing.
         DeathCount++;
     }
 
@@ -955,6 +987,7 @@ public abstract class GameWorldEvent
 public sealed class FireResolvedEvent : GameWorldEvent
 {
     public int ShooterPlayerId { get; init; }
+    public int FireSequence { get; init; }
     public int RequestTick { get; init; }
     public float OriginX { get; init; }
     public float OriginY { get; init; }
@@ -985,6 +1018,15 @@ public sealed class HealthChangedWorldEvent : GameWorldEvent
     public int MaxHealth { get; init; }
     public bool IsAlive { get; init; }
     public float RespawnRemainingSeconds { get; init; }
+}
+
+public sealed class FireResultWorldEvent : GameWorldEvent
+{
+    public int ShooterPlayerId { get; init; }
+    public int FireSequence { get; init; }
+    public string Result { get; init; } = string.Empty;
+    // Zero means no target was hit and is omitted from the JSON protocol.
+    public int TargetPlayerId { get; init; }
 }
 
 public sealed class DeathWorldEvent : GameWorldEvent

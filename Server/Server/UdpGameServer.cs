@@ -169,6 +169,15 @@ public sealed class UdpGameServer : IDisposable
 
                         foreach (ConnectedClient client in clientRegistry.GetAllClients())
                         {
+                            // FireResult is a private final answer to the player who made
+                            // this request. It still uses that client's normal reliable
+                            // ledger, but must never be replicated to observers.
+                            if (worldEvent is FireResultWorldEvent fireResult
+                                && client.PlayerId != fireResult.ShooterPlayerId)
+                            {
+                                continue;
+                            }
+
                             if (!IsEventRelevantToClient(client, relatedPlayerIds, candidates))
                             {
                                 continue;
@@ -533,6 +542,7 @@ public sealed class UdpGameServer : IDisposable
                     Type = "FireEvent",
                     ServerTick = fireEvent.ServerTick,
                     ShooterPlayerId = fireEvent.ShooterPlayerId,
+                    FireSequence = fireEvent.FireSequence,
                     RequestTick = fireEvent.RequestTick,
                     OriginX = fireEvent.OriginX,
                     OriginY = fireEvent.OriginY,
@@ -544,6 +554,17 @@ public sealed class UdpGameServer : IDisposable
                     LagCompensated = fireEvent.LagCompensated,
                     HitTestServerTick = fireEvent.HitTestServerTick,
                     RewindSeconds = fireEvent.RewindSeconds
+                };
+
+            case FireResultWorldEvent fireResult:
+                return new FireResultMessage
+                {
+                    Type = "FireResult",
+                    ServerTick = fireResult.ServerTick,
+                    PlayerId = fireResult.ShooterPlayerId,
+                    FireSequence = fireResult.FireSequence,
+                    Result = fireResult.Result,
+                    TargetPlayerId = fireResult.TargetPlayerId
                 };
 
             case HitResolvedEvent hitEvent:
@@ -623,7 +644,8 @@ public sealed class UdpGameServer : IDisposable
         return worldEvent is DeathWorldEvent
             || worldEvent is RespawnWorldEvent
             || worldEvent is KillWorldEvent
-            || worldEvent is MatchEndWorldEvent;
+            || worldEvent is MatchEndWorldEvent
+            || worldEvent is FireResultWorldEvent;
     }
 
     private static int[] GetRelatedPlayerIds(GameWorldEvent worldEvent)
@@ -631,6 +653,7 @@ public sealed class UdpGameServer : IDisposable
         return worldEvent switch
         {
             FireResolvedEvent fireEvent => new[] { fireEvent.ShooterPlayerId },
+            FireResultWorldEvent fireResult => new[] { fireResult.ShooterPlayerId },
             HitResolvedEvent hitEvent => new[] { hitEvent.ShooterPlayerId, hitEvent.TargetPlayerId },
             HealthChangedWorldEvent healthEvent => new[] { healthEvent.PlayerId },
             // Death and respawn drive an Avatar's local visual state, so only the affected
@@ -664,6 +687,9 @@ public sealed class UdpGameServer : IDisposable
                 break;
             case MatchEndEventMessage matchEndEvent:
                 matchEndEvent.EventId = eventId;
+                break;
+            case FireResultMessage fireResult:
+                fireResult.EventId = eventId;
                 break;
             default:
                 throw new InvalidOperationException($"Event '{networkEvent.GetType().Name}' is not a reliable event.");

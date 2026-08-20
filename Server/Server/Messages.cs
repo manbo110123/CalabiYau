@@ -206,6 +206,11 @@ public sealed class FireEventMessage
     [JsonPropertyName("shooterPlayerId")]
     public int ShooterPlayerId { get; set; }
 
+    // This stays on the ordinary FireEvent so a local client can avoid replaying its
+    // own immediate muzzle effect when the authoritative presentation event arrives.
+    [JsonPropertyName("fireSequence")]
+    public int FireSequence { get; set; }
+
     [JsonPropertyName("requestTick")]
     public int RequestTick { get; set; }
 
@@ -238,6 +243,36 @@ public sealed class FireEventMessage
 
     [JsonPropertyName("rewindSeconds")]
     public float RewindSeconds { get; set; }
+}
+
+// A reliable, final answer for one previously accepted FireRequest. Unlike a
+// FireReceipt, this is emitted only after GameWorld.Tick has resolved cooldown,
+// hit detection, and any resulting damage.
+public sealed class FireResultMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+
+    [JsonPropertyName("eventId")]
+    public long EventId { get; set; }
+
+    [JsonPropertyName("serverTick")]
+    public int ServerTick { get; set; }
+
+    [JsonPropertyName("playerId")]
+    public int PlayerId { get; set; }
+
+    [JsonPropertyName("fireSequence")]
+    public int FireSequence { get; set; }
+
+    [JsonPropertyName("result")]
+    public string Result { get; set; } = string.Empty;
+
+    // A target is useful only for fired-hit. Omitting the default keeps no-hit and
+    // rejection results focused on their own fireSequence and final decision.
+    [JsonPropertyName("targetPlayerId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int TargetPlayerId { get; set; }
 }
 
 public sealed class HitEventMessage

@@ -51,9 +51,11 @@ public class UdpNetworkClient : MonoBehaviour
     [Header("Reliable Fire Requests")]
     [SerializeField] private float fireReceiptTimeoutSeconds = 0.2f;
     [SerializeField] private int maxFireRequestResends = 3;
+    [SerializeField] private float localImmediateFireRange = 35f;
 
     [Header("Reliable Result Events")]
     [SerializeField] private int processedReliableEventCapacity = 128;
+    [SerializeField] private int localFireResultHistoryCapacity = 128;
 
     [Header("Debug")]
     [SerializeField] private bool logJsonMessages = false;
@@ -96,6 +98,12 @@ public class UdpNetworkClient : MonoBehaviour
     private bool lastFireReceiptAccepted;
     private string lastFireReceiptReason = string.Empty;
     private int lastFireReceiptServerTick;
+    private int receivedFireResultCount;
+    private int unmatchedFireResultCount;
+    private int lastFireResultSequence;
+    private string lastFireResult = string.Empty;
+    private int lastFireResultServerTick;
+    private int lastFireResultTargetPlayerId;
     private int receivedGameplayEventCount;
     private int receivedReliableEventCount;
     private int duplicateReliableEventDropCount;
@@ -128,6 +136,11 @@ public class UdpNetworkClient : MonoBehaviour
     private readonly List<BufferedLocalInput> localInputHistory = new List<BufferedLocalInput>();
     private readonly Queue<float> recentPredictionCorrectionTimes = new Queue<float>();
     private readonly Dictionary<int, PendingFireRequest> pendingFireRequests = new Dictionary<int, PendingFireRequest>();
+    // This is presentation bookkeeping, not a second network-reliability mechanism.
+    // It lets the local immediate fire feedback and its eventual authoritative result
+    // meet on the same fireSequence even after the FireReceipt has removed its retry.
+    private readonly Dictionary<int, LocalFirePresentation> localFirePresentationsBySequence = new Dictionary<int, LocalFirePresentation>();
+    private readonly Queue<int> localFirePresentationOrder = new Queue<int>();
     private readonly RecentReliableEventIds processedReliableEventIds = new RecentReliableEventIds();
     private readonly Dictionary<int, int> latestLifeStateVersionByPlayer = new Dictionary<int, int>();
     // One player can only have one newest unapplied life state. A newer death or respawn
@@ -376,11 +389,13 @@ public class UdpNetworkClient : MonoBehaviour
         message.interpolationDelaySeconds = remoteInterpolationDelaySeconds;
 
         QueueFireRequestForReceipt(message);
+        PlayImmediateLocalFirePresentation(message);
     }
 
     private void QueueFireRequestForReceipt(FireRequestMessage message)
     {
         string json = JsonUtility.ToJson(message);
+        RecordLocalFirePresentation(message.fireSequence);
         pendingFireRequests[message.fireSequence] = new PendingFireRequest
         {
             FireSequence = message.fireSequence,
@@ -392,6 +407,42 @@ public class UdpNetworkClient : MonoBehaviour
 
         sentFireRequestCount++;
         SendJson(json);
+    }
+
+    private void RecordLocalFirePresentation(int fireSequence)
+    {
+        localFirePresentationsBySequence[fireSequence] = new LocalFirePresentation
+        {
+            FireSequence = fireSequence
+        };
+        localFirePresentationOrder.Enqueue(fireSequence);
+
+        int historyCapacity = Mathf.Max(1, localFireResultHistoryCapacity);
+
+        while (localFirePresentationOrder.Count > historyCapacity)
+        {
+            localFirePresentationsBySequence.Remove(localFirePresentationOrder.Dequeue());
+        }
+    }
+
+    private void PlayImmediateLocalFirePresentation(FireRequestMessage request)
+    {
+        if (localTank == null || localAvatar == null
+            || !localFirePresentationsBySequence.TryGetValue(request.fireSequence, out LocalFirePresentation presentation))
+        {
+            return;
+        }
+
+        Vector3 origin = localTank.CurrentFireOrigin;
+        Vector3 direction = new Vector3(request.aimX, origin.y, request.aimZ) - origin;
+
+        if (direction.sqrMagnitude < 0.0001f)
+        {
+            direction = localTank.CurrentFireDirection;
+        }
+
+        localAvatar.PlayNetworkFire(origin, direction.normalized, Mathf.Max(0f, localImmediateFireRange));
+        presentation.LocalPresentationPlayed = true;
     }
 
     private void RetryPendingFireRequests()
@@ -589,6 +640,10 @@ public class UdpNetworkClient : MonoBehaviour
                 HandleFireReceipt(json);
                 break;
 
+            case "FireResult":
+                HandleFireResult(json);
+                break;
+
             case "FireEvent":
                 HandleFireEvent(json);
                 break;
@@ -678,6 +733,12 @@ public class UdpNetworkClient : MonoBehaviour
         lastFireReceiptReason = receipt.reason;
         lastFireReceiptServerTick = receipt.serverTick;
 
+        if (localFirePresentationsBySequence.TryGetValue(receipt.fireSequence, out LocalFirePresentation presentation))
+        {
+            presentation.HasReceipt = true;
+            presentation.ReceiptAccepted = receipt.accepted;
+        }
+
         if (receipt.accepted)
         {
             acceptedFireReceiptCount++;
@@ -694,6 +755,53 @@ public class UdpNetworkClient : MonoBehaviour
                 $"sequence={receipt.fireSequence}, accepted={receipt.accepted}, reason={receipt.reason}. " +
                 "This confirms receipt only; hit and damage still come from gameplay events.");
         }
+    }
+
+    private void HandleFireResult(string json)
+    {
+        FireResultMessage fireResult = JsonUtility.FromJson<FireResultMessage>(json);
+
+        // FireResult shares the same eventId ACK and finite deduplication rule as the
+        // lifecycle events. A repeated UDP datagram is acknowledged again but cannot
+        // replay a local rejection/confirmation effect.
+        ProcessReliableEvent(fireResult.eventId, () =>
+        {
+            if (fireResult.playerId != playerId)
+            {
+                Debug.LogWarning($"FireResult ignored: playerId={fireResult.playerId}, local playerId={playerId}.");
+                return;
+            }
+
+            receivedFireResultCount++;
+            lastFireResultSequence = fireResult.fireSequence;
+            lastFireResult = fireResult.result;
+            lastFireResultServerTick = fireResult.serverTick;
+            lastFireResultTargetPlayerId = fireResult.targetPlayerId;
+
+            if (localFirePresentationsBySequence.TryGetValue(fireResult.fireSequence, out LocalFirePresentation presentation))
+            {
+                presentation.HasFinalResult = true;
+                presentation.FinalResult = fireResult.result;
+                presentation.FinalServerTick = fireResult.serverTick;
+                presentation.TargetPlayerId = fireResult.targetPlayerId;
+            }
+            else
+            {
+                // The bounded local presentation history may have expired, but the
+                // reliable result is still valid and observable on its own.
+                unmatchedFireResultCount++;
+            }
+
+            if (logGameplayEvents)
+            {
+                string targetText = fireResult.targetPlayerId > 0
+                    ? $", target={fireResult.targetPlayerId}"
+                    : string.Empty;
+                Debug.Log(
+                    $"FireResult eventId={fireResult.eventId}, tick={fireResult.serverTick}, " +
+                    $"sequence={fireResult.fireSequence}, result={fireResult.result}{targetText}.");
+            }
+        });
     }
 
     private void ApplyWorldSnapshot(WorldSnapshotMessage snapshot)
@@ -723,6 +831,20 @@ public class UdpNetworkClient : MonoBehaviour
     {
         FireEventMessage fireEvent = JsonUtility.FromJson<FireEventMessage>(json);
         receivedGameplayEventCount++;
+
+        if (fireEvent.shooterPlayerId == playerId
+            && fireEvent.fireSequence > 0
+            && localFirePresentationsBySequence.TryGetValue(fireEvent.fireSequence, out LocalFirePresentation localPresentation)
+            && localPresentation.LocalPresentationPlayed)
+        {
+            // The shooter already played the immediate visual on input. FireEvent remains
+            // the normal, unreliable presentation event for every other observer.
+            localPresentation.AuthoritativeFireEventObserved = true;
+            lastFireUsedLagCompensation = fireEvent.lagCompensated;
+            lastLagCompensationHitTestServerTick = fireEvent.hitTestServerTick;
+            lastLagCompensationRewindSeconds = fireEvent.rewindSeconds;
+            return;
+        }
 
         NetworkTankAvatar shooterAvatar = GetAvatarByPlayerId(fireEvent.shooterPlayerId);
 
@@ -1236,6 +1358,14 @@ public class UdpNetworkClient : MonoBehaviour
         lastFireReceiptAccepted = false;
         lastFireReceiptReason = string.Empty;
         lastFireReceiptServerTick = 0;
+        receivedFireResultCount = 0;
+        unmatchedFireResultCount = 0;
+        lastFireResultSequence = 0;
+        lastFireResult = string.Empty;
+        lastFireResultServerTick = 0;
+        lastFireResultTargetPlayerId = 0;
+        localFirePresentationsBySequence.Clear();
+        localFirePresentationOrder.Clear();
         receivedGameplayEventCount = 0;
         receivedReliableEventCount = 0;
         duplicateReliableEventDropCount = 0;
@@ -1767,7 +1897,7 @@ public class UdpNetworkClient : MonoBehaviour
 
         EnsureDebugPanelStyles();
 
-        const int debugRowCount = 21;
+        const int debugRowCount = 22;
         const float titleHeight = 28f;
         const float rowHeight = 24f;
         const float panelPaddingHeight = 28f;
@@ -1798,6 +1928,7 @@ public class UdpNetworkClient : MonoBehaviour
         DrawDebugRow("Filtered remote cleanup", removedRemoteAvatarCount.ToString());
         DrawDebugRow("Fire request receipts", FormatFireReceiptDeliveryText());
         DrawDebugRow("Last fire receipt", FormatLastFireReceiptText());
+        DrawDebugRow("Final fire results", FormatFireResultText());
         DrawDebugRow("Reliable results", FormatReliableResultEventsText());
         DrawDebugRow("Fire lag compensation", FormatLagCompensationText());
         DrawDebugRow("Correction budget", FormatCorrectionBudgetText());
@@ -2015,6 +2146,19 @@ public class UdpNetworkClient : MonoBehaviour
         return $"{result} seq {lastFireReceiptSequence}, tick {lastFireReceiptServerTick}, {lastFireReceiptReason}";
     }
 
+    private string FormatFireResultText()
+    {
+        if (lastFireResultSequence <= 0)
+        {
+            return $"waiting, received {receivedFireResultCount}";
+        }
+
+        string targetText = lastFireResultTargetPlayerId > 0
+            ? $", target {lastFireResultTargetPlayerId}"
+            : string.Empty;
+        return $"seq {lastFireResultSequence}, {lastFireResult}, tick {lastFireResultServerTick}{targetText}, unmatched {unmatchedFireResultCount}";
+    }
+
     private string FormatReliableResultEventsText()
     {
         return $"recent {processedReliableEventIds.Count}, received {receivedReliableEventCount}, duplicate drops {duplicateReliableEventDropCount}, stale life drops {discardedStaleLifecycleEventCount}, pending life {pendingLifecycleEventsByPlayer.Count}";
@@ -2096,6 +2240,20 @@ public class FireReceiptMessage
 }
 
 [Serializable]
+public class FireResultMessage
+{
+    public string type;
+    public long eventId;
+    public int serverTick;
+    public int playerId;
+    public int fireSequence;
+    public string result;
+    // Zero means this was a no-hit or rejected final result, so the server omitted
+    // targetPlayerId from its JSON payload.
+    public int targetPlayerId;
+}
+
+[Serializable]
 public class WorldSnapshotMessage
 {
     public string type;
@@ -2137,6 +2295,7 @@ public class FireEventMessage
     public string type;
     public int serverTick;
     public int shooterPlayerId;
+    public int fireSequence;
     public int requestTick;
     public float originX;
     public float originY;
@@ -2245,6 +2404,19 @@ public class PendingFireRequest
     public string Json;
     public float LastSentTime;
     public int ResendCount;
+}
+
+public class LocalFirePresentation
+{
+    public int FireSequence;
+    public bool LocalPresentationPlayed;
+    public bool AuthoritativeFireEventObserved;
+    public bool HasReceipt;
+    public bool ReceiptAccepted;
+    public bool HasFinalResult;
+    public string FinalResult;
+    public int FinalServerTick;
+    public int TargetPlayerId;
 }
 
 public class PendingLifecycleEvent
