@@ -5,6 +5,11 @@ internal static class Program
 {
     private static void Main()
     {
+        CollisionCoreTests.RunAll();
+        TankWorldCollision2DTests.RunAll();
+        GameWorldAuthoritativeCollisionTests.RunAll();
+        GameWorldGameplayQueryTests.RunAll();
+        CollisionMapHandshakeTests.RunAll();
         DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward();
         InputLeaseStopsMovementAfterCommandsExpire();
         InvalidAndFutureInputsAreRejectedAtTheWorldGate();
@@ -31,7 +36,7 @@ internal static class Program
         LifecycleEventsCarryPerPlayerMonotonicVersions();
         SnapshotsContinueWhileReliableEventsAwaitAcknowledgement();
 
-        Console.WriteLine("GameWorld command timeline, reliable fire receipt, replication, and reliable result-event checks passed.");
+        Console.WriteLine("CollisionCore math, authoritative Tank collision, gameplay space queries, collision-map handshake, prediction command replay, GameWorld command timeline, reliable fire receipt, replication, and reliable result-event checks passed.");
     }
 
     private static void DuplicateAndOutOfOrderInputsDoNotMoveTheWorldBackward()

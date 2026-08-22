@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using CalabiYau.TankCollision;
 
 public sealed class UdpGameServerOptions
 {
@@ -43,6 +44,8 @@ public sealed class UdpGameServer : IDisposable
     {
         Console.WriteLine($"UDP server started on port {options.ListenPort}.");
         Console.WriteLine($"Server authority tick rate: {options.TickRate} Hz.");
+        Console.WriteLine(
+            $"Collision map: {TrainingCollisionMap2D.MapId}@{TrainingCollisionMap2D.CollisionRevision}.");
         Console.WriteLine($"Per-client snapshot rate: {GetSnapshotRate()} Hz, distance filtering: {options.ReplicationSettings.EnableDistanceFiltering}.");
         Console.WriteLine("Waiting for Unity ClientHello, PlayerInput and FireRequest messages...");
 
@@ -61,7 +64,22 @@ public sealed class UdpGameServer : IDisposable
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            UdpReceiveResult received = await udpServer.ReceiveAsync(cancellationToken);
+            UdpReceiveResult received;
+
+            try
+            {
+                received = await udpServer.ReceiveAsync(cancellationToken);
+            }
+            catch (SocketException exception)
+                when (exception.SocketErrorCode == SocketError.ConnectionReset)
+            {
+                // On Windows, an ICMP "port unreachable" from a client that closed
+                // without ClientGoodbye can surface on the next UDP receive. UDP has no
+                // connection to tear down, so keep the authoritative listener alive.
+                Console.WriteLine("UDP receive ignored a remote port reset.");
+                continue;
+            }
+
             string json = Encoding.UTF8.GetString(received.Buffer);
             string clientKey = ClientRegistry.GetClientKey(received.RemoteEndPoint);
 
@@ -255,8 +273,28 @@ public sealed class UdpGameServer : IDisposable
             return;
         }
 
+        if (hello == null
+            || !TrainingCollisionMap2D.IsCompatible(hello.MapId, hello.CollisionRevision))
+        {
+            ServerRejectMessage rejection = new ServerRejectMessage
+            {
+                Type = "ServerReject",
+                Reason = "collision-map-mismatch",
+                ExpectedMapId = TrainingCollisionMap2D.MapId,
+                ExpectedCollisionRevision = TrainingCollisionMap2D.CollisionRevision
+            };
+            Console.WriteLine(
+                $"ClientHello rejected: collision map "
+                + $"'{hello?.MapId ?? string.Empty}'@{hello?.CollisionRevision ?? 0} does not match "
+                + $"'{TrainingCollisionMap2D.MapId}'@{TrainingCollisionMap2D.CollisionRevision}.");
+            await SendJsonAsync(rejection, remoteEndPoint);
+            return;
+        }
+
         string playerName = string.IsNullOrWhiteSpace(hello?.Name) ? "Player" : hello.Name;
         ClientRegistration registration;
+        string spawnRejectionReason = string.Empty;
+        bool spawnAccepted = true;
 
         lock (stateLock)
         {
@@ -264,8 +302,18 @@ public sealed class UdpGameServer : IDisposable
 
             if (registration.IsNewClient)
             {
-                world.AddPlayer(registration.Client.PlayerId);
-                Console.WriteLine($"New client connected: {playerName}, playerId={registration.Client.PlayerId}");
+                spawnAccepted = world.AddPlayer(
+                    registration.Client.PlayerId,
+                    out spawnRejectionReason);
+
+                if (spawnAccepted)
+                {
+                    Console.WriteLine($"New client connected: {playerName}, playerId={registration.Client.PlayerId}");
+                }
+                else
+                {
+                    clientRegistry.TryRemove(remoteEndPoint, out _);
+                }
             }
             else
             {
@@ -273,11 +321,29 @@ public sealed class UdpGameServer : IDisposable
             }
         }
 
+        if (!spawnAccepted)
+        {
+            ServerRejectMessage rejection = new ServerRejectMessage
+            {
+                Type = "ServerReject",
+                Reason = $"spawn-unavailable:{spawnRejectionReason}",
+                ExpectedMapId = TrainingCollisionMap2D.MapId,
+                ExpectedCollisionRevision = TrainingCollisionMap2D.CollisionRevision
+            };
+            Console.WriteLine(
+                $"ClientHello rejected: playerId={registration.Client.PlayerId}, "
+                + $"spawnReason={spawnRejectionReason}.");
+            await SendJsonAsync(rejection, remoteEndPoint);
+            return;
+        }
+
         ServerWelcomeMessage welcome = new ServerWelcomeMessage
         {
             Type = "ServerWelcome",
             PlayerId = registration.Client.PlayerId,
             ServerTickRate = options.TickRate,
+            MapId = TrainingCollisionMap2D.MapId,
+            CollisionRevision = TrainingCollisionMap2D.CollisionRevision,
             Message = "Welcome to the UDP demo server."
         };
 
@@ -471,6 +537,11 @@ public sealed class UdpGameServer : IDisposable
             $"Tick={world.ServerTick}, players={world.Players.Count}, " +
             $"input={world.AcceptedInputCount}/{world.ReceivedInputCount}, inputRejected={world.RejectedInputCount}, " +
             $"inputSuperseded={world.SupersededInputCount}, inputReasons=[{world.GetInputRejectionSummary()}], " +
+            $"collisionBlocked={world.BlockedMovementTickCount}, rotationBlocked={world.BlockedRotationTickCount}, " +
+            $"collisionResolutions={world.CollisionResolutionCount}, " +
+            $"fireStaticBlocked={world.StaticOccludedFireCount}, " +
+            $"spawnRejected={world.SpawnCandidateRejectionCount}, spawnFailures={world.SpawnPlacementFailureCount}, " +
+            $"spawnReasons=[{world.GetSpawnRejectionSummary()}], " +
             $"snapshotDatagrams={sentSnapshotCount}, snapshotRate={GetSnapshotRate()}Hz, " +
             $"distanceFiltering={options.ReplicationSettings.EnableDistanceFiltering}, " +
             $"fire={world.AcceptedFireRequestCount}/{world.ReceivedFireRequestCount}, " +

@@ -1,3 +1,6 @@
+using CalabiYau.CollisionCore;
+using CalabiYau.TankCollision;
+
 public sealed class GameWorldSettings
 {
     public int ServerTickRate { get; set; } = 30;
@@ -44,18 +47,25 @@ public sealed class GameWorldSettings
 public sealed class GameWorld
 {
     private readonly GameWorldSettings settings;
+    private readonly TankWorldCollision2D collisionWorld;
+    private readonly TankMapQueries2D mapQueries;
     private readonly Dictionary<int, PlayerState> playersById = new Dictionary<int, PlayerState>();
     private readonly Dictionary<string, long> inputRejectionsByReason = new Dictionary<string, long>();
     private readonly Dictionary<string, long> fireRejectionsByReason = new Dictionary<string, long>();
+    private readonly Dictionary<string, long> spawnRejectionsByReason = new Dictionary<string, long>();
 
     public GameWorld()
-        : this(new GameWorldSettings())
+        : this(new GameWorldSettings(), null)
     {
     }
 
-    public GameWorld(GameWorldSettings settings)
+    public GameWorld(
+        GameWorldSettings settings,
+        TankWorldCollision2D? collisionWorld = null)
     {
-        this.settings = settings;
+        this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        this.collisionWorld = collisionWorld ?? TrainingCollisionMap2D.CreateResolver();
+        mapQueries = new TankMapQueries2D(this.collisionWorld.Map);
     }
 
     public int ServerTick { get; private set; }
@@ -72,17 +82,37 @@ public sealed class GameWorld
     public long DeathCount { get; private set; }
     public long RespawnCount { get; private set; }
     public long LagCompensatedFireRequestCount { get; private set; }
+    public long BlockedMovementTickCount { get; private set; }
+    public long BlockedRotationTickCount { get; private set; }
+    public long CollisionResolutionCount { get; private set; }
+    public long StaticOccludedFireCount { get; private set; }
+    public long SpawnCandidateRejectionCount { get; private set; }
+    public long SpawnPlacementFailureCount { get; private set; }
     public IReadOnlyDictionary<string, long> InputRejectionsByReason => inputRejectionsByReason;
     public IReadOnlyDictionary<string, long> FireRejectionsByReason => fireRejectionsByReason;
+    public IReadOnlyDictionary<string, long> SpawnRejectionsByReason => spawnRejectionsByReason;
 
     public bool AddPlayer(int playerId)
     {
+        return AddPlayer(playerId, out _);
+    }
+
+    public bool AddPlayer(int playerId, out string rejectionReason)
+    {
         if (playersById.ContainsKey(playerId))
         {
+            rejectionReason = "duplicate-player";
             return false;
         }
 
-        playersById.Add(playerId, CreateInitialPlayerState(playerId));
+        if (!TryFindSpawnRootPosition(playerId, out Vec2D spawn, out rejectionReason))
+        {
+            SpawnPlacementFailureCount++;
+            return false;
+        }
+
+        playersById.Add(playerId, CreateInitialPlayerState(playerId, spawn));
+        rejectionReason = string.Empty;
         return true;
     }
 
@@ -175,6 +205,11 @@ public sealed class GameWorld
     public string GetFireRejectionSummary()
     {
         return FormatRejectionSummary(fireRejectionsByReason);
+    }
+
+    public string GetSpawnRejectionSummary()
+    {
+        return FormatRejectionSummary(spawnRejectionsByReason);
     }
 
     // Fire is a discrete command. Reception only validates and queues it; the fixed Tick
@@ -324,7 +359,32 @@ public sealed class GameWorld
             }
 
             FireRay fireRay = BuildFireRay(shooterFrame.X, shooterFrame.Z, shooterFrame.BodyYaw, command);
-            int hitPlayerId = FindFirstHitPlayer(shooter.PlayerId, fireRay, shooterFrame.HitTestServerTick, out float hitDistance);
+            Ray2D staticRay = new Ray2D(
+                new Vec2D(fireRay.OriginX, fireRay.OriginZ),
+                new Vec2D(fireRay.DirectionX, fireRay.DirectionZ));
+            bool hasStaticHit = mapQueries.RaycastStatic(
+                staticRay,
+                settings.FireRange,
+                out StaticRaycastHit2D staticHit);
+            int candidatePlayerId = FindFirstHitPlayer(
+                shooter.PlayerId,
+                fireRay,
+                shooterFrame.HitTestServerTick,
+                out float candidatePlayerDistance);
+            bool staticObstacleWins = hasStaticHit
+                && (candidatePlayerId == 0
+                    || staticHit.Distance <= candidatePlayerDistance + collisionWorld.Map.Epsilon);
+            int hitPlayerId = staticObstacleWins ? 0 : candidatePlayerId;
+            float hitDistance = hitPlayerId == 0 ? 0f : candidatePlayerDistance;
+
+            if (staticObstacleWins)
+            {
+                StaticOccludedFireCount++;
+            }
+
+            float presentationRange = hasStaticHit
+                ? MathF.Min(settings.FireRange, staticHit.Distance)
+                : settings.FireRange;
 
             AddFireResult(
                 eventsToBroadcast,
@@ -345,7 +405,7 @@ public sealed class GameWorld
                 DirectionX = fireRay.DirectionX,
                 DirectionY = 0f,
                 DirectionZ = fireRay.DirectionZ,
-                Range = settings.FireRange,
+                Range = presentationRange,
                 LagCompensated = shooterFrame.RewindTicks > 0,
                 HitTestServerTick = shooterFrame.HitTestServerTick,
                 RewindSeconds = shooterFrame.RewindSeconds
@@ -432,29 +492,103 @@ public sealed class GameWorld
         return remainingTicks / (float)settings.ServerTickRate;
     }
 
-    private PlayerState CreateInitialPlayerState(int playerId)
+    private PlayerState CreateInitialPlayerState(int playerId, Vec2D spawn)
     {
-        float spawnX = (playerId - 1) * 4f;
-
         PlayerState player = new PlayerState
         {
             PlayerId = playerId,
-            X = spawnX,
+            X = spawn.X,
             Y = 0f,
-            Z = 0f,
+            Z = spawn.Y,
             BodyYaw = 0f,
-            AimX = spawnX,
-            AimZ = 5f,
+            AimX = spawn.X,
+            AimZ = spawn.Y + 5f,
             Health = settings.MaxHealth,
             IsAlive = true,
             LifeStateVersion = 1,
             NextAllowedFireServerTick = 0,
             RespawnServerTick = 0,
-            LatestInput = new InputCommand(0, 0f, 0f, spawnX, 5f)
+            LatestInput = new InputCommand(0, 0f, 0f, spawn.X, spawn.Y + 5f)
         };
 
         StorePlayerHistory(player);
         return player;
+    }
+
+    private bool TryFindSpawnRootPosition(
+        int playerId,
+        out Vec2D spawn,
+        out string rejectionReason)
+    {
+        for (int candidateOffset = 0;
+             candidateOffset < TrainingCollisionMap2D.SpawnCandidateCount;
+             candidateOffset++)
+        {
+            Vec2D candidate = TrainingCollisionMap2D.GetSpawnCandidateRootPosition(
+                playerId,
+                candidateOffset);
+            TankPose2D candidatePose = new TankPose2D(candidate, 0f);
+            Obb2D candidateShape = collisionWorld.CreateTankShape(candidatePose);
+
+            if (!mapQueries.IsInsideWorldBounds(candidateShape))
+            {
+                RejectSpawnCandidate("outside-world-bounds");
+                continue;
+            }
+
+            if (mapQueries.OverlapStatic(candidateShape, out StaticOverlapHit2D staticHit)
+                && staticHit.PenetrationDepth > collisionWorld.Map.Epsilon)
+            {
+                RejectSpawnCandidate("overlaps-static-collider");
+                continue;
+            }
+
+            bool occupiedByAlivePlayer = false;
+
+            foreach (PlayerState otherPlayer in playersById.Values)
+            {
+                if (otherPlayer.PlayerId == playerId || !otherPlayer.IsAlive)
+                {
+                    continue;
+                }
+
+                Obb2D otherShape = collisionWorld.CreateTankShape(new TankPose2D(
+                    new Vec2D(otherPlayer.X, otherPlayer.Z),
+                    DegreesToRadians(otherPlayer.BodyYaw)));
+
+                OverlapResult2D occupancy = CollisionQueries2D.Overlap(
+                        candidateShape,
+                        otherShape,
+                        collisionWorld.Map.Epsilon);
+
+                if (occupancy.Hit
+                    && occupancy.PenetrationDepth > collisionWorld.Map.Epsilon)
+                {
+                    occupiedByAlivePlayer = true;
+                    break;
+                }
+            }
+
+            if (occupiedByAlivePlayer)
+            {
+                RejectSpawnCandidate("occupied-by-alive-player");
+                continue;
+            }
+
+            spawn = candidate;
+            rejectionReason = string.Empty;
+            return true;
+        }
+
+        spawn = Vec2D.Zero;
+        rejectionReason = "no-valid-spawn-candidate";
+        return false;
+    }
+
+    private void RejectSpawnCandidate(string reason)
+    {
+        SpawnCandidateRejectionCount++;
+        IncrementRejectionCount(spawnRejectionsByReason, reason);
     }
 
     private void SimulatePlayer(PlayerState player, float deltaTime)
@@ -465,19 +599,35 @@ public sealed class GameWorld
         }
 
         InputCommand input = player.LatestInput;
-        float moveAxis = input.MoveAxis;
-        float turnAxis = input.TurnAxis;
+        TankPose2D start = new TankPose2D(
+            new Vec2D(player.X, player.Z),
+            DegreesToRadians(player.BodyYaw));
+        TankMoveResult2D movement = TankCommandSimulation2D.Simulate(
+            collisionWorld,
+            start,
+            input.MoveAxis,
+            input.TurnAxis,
+            settings.PlayerMoveSpeed,
+            settings.PlayerTurnDegreesPerSecond,
+            deltaTime);
 
-        player.BodyYaw += turnAxis * settings.PlayerTurnDegreesPerSecond * deltaTime;
-
-        float yawRadians = DegreesToRadians(player.BodyYaw);
-        float forwardX = MathF.Sin(yawRadians);
-        float forwardZ = MathF.Cos(yawRadians);
-
-        player.X += forwardX * settings.PlayerMoveSpeed * moveAxis * deltaTime;
-        player.Z += forwardZ * settings.PlayerMoveSpeed * moveAxis * deltaTime;
+        player.X = movement.Pose.Position.X;
+        player.Z = movement.Pose.Position.Y;
+        player.BodyYaw = RadiansToDegrees(movement.Pose.GameplayYawRadians);
         player.AimX = input.AimX;
         player.AimZ = input.AimZ;
+
+        if (movement.WasBlocked)
+        {
+            BlockedMovementTickCount++;
+        }
+
+        if (movement.RotationBlocked)
+        {
+            BlockedRotationTickCount++;
+        }
+
+        CollisionResolutionCount += movement.CollisionCount;
     }
 
     private void KillPlayer(PlayerState player)
@@ -506,19 +656,32 @@ public sealed class GameWorld
             return null;
         }
 
-        float spawnX = (player.PlayerId - 1) * 4f;
-        player.X = spawnX;
+        if (!TryFindSpawnRootPosition(player.PlayerId, out Vec2D spawn, out _))
+        {
+            // Keep the player dead and retry at a bounded cadence. This makes a full
+            // spawn set observable without silently inserting a Tank into a wall/player.
+            SpawnPlacementFailureCount++;
+            player.RespawnServerTick = ServerTick + Math.Max(1, settings.ServerTickRate);
+            return null;
+        }
+
+        player.X = spawn.X;
         player.Y = 0f;
-        player.Z = 0f;
+        player.Z = spawn.Y;
         player.BodyYaw = 0f;
-        player.AimX = spawnX;
-        player.AimZ = 5f;
+        player.AimX = spawn.X;
+        player.AimZ = spawn.Y + 5f;
         player.Health = settings.MaxHealth;
         player.IsAlive = true;
         player.LifeStateVersion++;
         player.RespawnServerTick = 0;
         player.NextAllowedFireServerTick = ServerTick + Math.Max(1, (int)MathF.Ceiling(0.25f * settings.ServerTickRate));
-        player.LatestInput = new InputCommand(player.LatestInput.InputTick, 0f, 0f, spawnX, 5f);
+        player.LatestInput = new InputCommand(
+            player.LatestInput.InputTick,
+            0f,
+            0f,
+            spawn.X,
+            spawn.Y + 5f);
         player.PendingInputs.Clear();
         player.PendingFires.Clear();
         RespawnCount++;
@@ -826,35 +989,29 @@ public sealed class GameWorld
 
     private bool TryRayCircleHit(FireRay fireRay, float targetXPosition, float targetZPosition, out float hitDistance)
     {
-        float targetX = targetXPosition - fireRay.OriginX;
-        float targetZ = targetZPosition - fireRay.OriginZ;
-        float projectedDistance = targetX * fireRay.DirectionX + targetZ * fireRay.DirectionZ;
-
-        if (projectedDistance < 0f || projectedDistance > settings.FireRange)
-        {
-            hitDistance = 0f;
-            return false;
-        }
-
-        float closestX = fireRay.DirectionX * projectedDistance;
-        float closestZ = fireRay.DirectionZ * projectedDistance;
-        float distanceX = targetX - closestX;
-        float distanceZ = targetZ - closestZ;
-        float squaredDistance = distanceX * distanceX + distanceZ * distanceZ;
-
-        if (squaredDistance > settings.HitRadius * settings.HitRadius)
-        {
-            hitDistance = 0f;
-            return false;
-        }
-
-        hitDistance = projectedDistance;
-        return true;
+        Ray2D ray = new Ray2D(
+            new Vec2D(fireRay.OriginX, fireRay.OriginZ),
+            new Vec2D(fireRay.DirectionX, fireRay.DirectionZ));
+        Circle2D target = new Circle2D(
+            new Vec2D(targetXPosition, targetZPosition),
+            settings.HitRadius);
+        RaycastResult2D query = CollisionQueries2D.Raycast(
+            ray,
+            target,
+            settings.FireRange,
+            collisionWorld.Map.Epsilon);
+        hitDistance = query.Hit ? query.Distance : 0f;
+        return query.Hit;
     }
 
     private static float DegreesToRadians(float degrees)
     {
         return degrees * MathF.PI / 180f;
+    }
+
+    private static float RadiansToDegrees(float radians)
+    {
+        return radians * 180f / MathF.PI;
     }
 }
 

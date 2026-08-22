@@ -331,8 +331,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: a79441f348de89743a2939f4d699eac1, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
+  m_Name:
+  m_EditorClassIdentifier:
   m_RenderShadows: 1
   m_RequiresDepthTextureOption: 2
   m_RequiresOpaqueTextureOption: 2
@@ -730,6 +730,7 @@ GameObject:
   - component: {fileID: 987447902}
   - component: {fileID: 987447901}
   - component: {fileID: 987447900}
+  - component: {fileID: 987447905}
   m_Layer: 0
   m_Name: Cube (2)
   m_TagString: Untagged
@@ -753,6 +754,19 @@ Rigidbody:
   m_Interpolate: 0
   m_Constraints: 0
   m_CollisionDetection: 1
+--- !u!114 &987447905
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 987447899}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 84e2c5648f2a4d3bba5446e530a4ec37, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  colliderId: 3
 --- !u!65 &987447901
 BoxCollider:
   m_ObjectHideFlags: 0
@@ -981,15 +995,26 @@ MonoBehaviour:
   hardCorrectionBaseDistance: 1.25
   rttCorrectionThresholdScale: 0.5
   smoothCorrectionSpeed: 5
-  smoothCorrectionWhileInputActive: 1
+  smoothCorrectionMaxSeconds: 0.5
+  deferPredictionCorrectionWhileInputActive: 1
+  predictionCorrectionInputGraceSeconds: 0.2
   activeInputDeadZone: 0.05
   interpolateRemotePlayers: 1
   remoteInterpolationDelaySeconds: 0.1
   remoteInterpolationBufferSize: 8
+  fireReceiptTimeoutSeconds: 0.2
+  maxFireRequestResends: 3
+  localImmediateFireRange: 35
+  processedReliableEventCapacity: 128
+  localFireResultHistoryCapacity: 128
   logJsonMessages: 0
   logSnapshots: 0
   logLocalPrediction: 0
   logGameplayEvents: 1
+  showNetworkDebugPanel: 1
+  debugPanelToggleKey: 284
+  debugPanelPosition: {x: 12, y: 12}
+  debugPanelWidth: 360
 --- !u!4 &1907406081
 Transform:
   m_ObjectHideFlags: 0

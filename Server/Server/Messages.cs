@@ -7,6 +7,12 @@ public sealed class ClientHelloMessage
 
     [JsonPropertyName("name")]
     public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("mapId")]
+    public string MapId { get; set; } = string.Empty;
+
+    [JsonPropertyName("collisionRevision")]
+    public int CollisionRevision { get; set; }
 }
 
 public sealed class ServerWelcomeMessage
@@ -24,6 +30,27 @@ public sealed class ServerWelcomeMessage
     // remote interpolation and estimating the current server Tick.
     [JsonPropertyName("serverTickRate")]
     public int ServerTickRate { get; set; }
+
+    [JsonPropertyName("mapId")]
+    public string MapId { get; set; } = string.Empty;
+
+    [JsonPropertyName("collisionRevision")]
+    public int CollisionRevision { get; set; }
+}
+
+public sealed class ServerRejectMessage
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+
+    [JsonPropertyName("reason")]
+    public string Reason { get; set; } = string.Empty;
+
+    [JsonPropertyName("expectedMapId")]
+    public string ExpectedMapId { get; set; } = string.Empty;
+
+    [JsonPropertyName("expectedCollisionRevision")]
+    public int ExpectedCollisionRevision { get; set; }
 }
 
 public sealed class PlayerInputMessage

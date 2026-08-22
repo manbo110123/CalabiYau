@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using CalabiYau.CollisionCore;
+using CalabiYau.TankCollision;
 using UnityEngine;
 
 public class UdpNetworkClient : MonoBehaviour
@@ -72,6 +74,10 @@ public class UdpNetworkClient : MonoBehaviour
     // The local input send rate remains configurable. This value is only for time
     // calculations expressed on the authoritative server's Tick timeline.
     private float serverTickRate = 30f;
+    private TankWorldCollision2D collisionWorld;
+    private TankMapQueries2D mapQueries;
+    private bool connectionRejected;
+    private string connectionRejectionReason = string.Empty;
     private int inputTick;
     private float inputTimer;
     private bool hasAppliedInitialLocalServerSnapshot;
@@ -194,6 +200,13 @@ public class UdpNetworkClient : MonoBehaviour
     private void OnApplicationQuit()
     {
         SendClientGoodbye();
+        NetworkStaticMapBody2D.SetNetworkModeForAll(false);
+        CloseSocket();
+    }
+
+    private void OnDisable()
+    {
+        NetworkStaticMapBody2D.SetNetworkModeForAll(false);
         CloseSocket();
     }
 
@@ -217,11 +230,15 @@ public class UdpNetworkClient : MonoBehaviour
     [ContextMenu("Send ClientHello")]
     public void SendClientHello()
     {
+        connectionRejected = false;
+        connectionRejectionReason = string.Empty;
         OpenSocket();
 
         ClientHelloMessage message = new ClientHelloMessage();
         message.type = "ClientHello";
         message.name = playerName;
+        message.mapId = TrainingCollisionMap2D.MapId;
+        message.collisionRevision = TrainingCollisionMap2D.CollisionRevision;
 
         SendJson(JsonUtility.ToJson(message));
     }
@@ -267,6 +284,8 @@ public class UdpNetworkClient : MonoBehaviour
 
     private void ApplyNetworkControlMode()
     {
+        NetworkStaticMapBody2D.SetNetworkModeForAll(serverAuthoritativeMovement);
+
         if (localTank == null || !serverAuthoritativeMovement)
         {
             return;
@@ -305,6 +324,8 @@ public class UdpNetworkClient : MonoBehaviour
 
     private void ApplyOfflineControlMode()
     {
+        NetworkStaticMapBody2D.SetNetworkModeForAll(false);
+
         if (localTank != null)
         {
             localTank.SetLocalControlEnabled(true);
@@ -441,7 +462,24 @@ public class UdpNetworkClient : MonoBehaviour
             direction = localTank.CurrentFireDirection;
         }
 
-        localAvatar.PlayNetworkFire(origin, direction.normalized, Mathf.Max(0f, localImmediateFireRange));
+        float presentationRange = Mathf.Max(0f, localImmediateFireRange);
+        Vec2D queryDirection = new Vec2D(direction.x, direction.z);
+
+        if (presentationRange > 0f
+            && queryDirection.TryNormalize(out _, CollisionMath2D.DefaultEpsilon))
+        {
+            EnsureCollisionWorld();
+            CalabiYau.CollisionCore.Ray2D ray = new CalabiYau.CollisionCore.Ray2D(
+                new Vec2D(origin.x, origin.z),
+                queryDirection);
+
+            if (mapQueries.RaycastStatic(ray, presentationRange, out StaticRaycastHit2D staticHit))
+            {
+                presentationRange = Mathf.Min(presentationRange, staticHit.Distance);
+            }
+        }
+
+        localAvatar.PlayNetworkFire(origin, direction.normalized, presentationRange);
         presentation.LocalPresentationPlayed = true;
     }
 
@@ -632,6 +670,10 @@ public class UdpNetworkClient : MonoBehaviour
                 HandleServerWelcome(json);
                 break;
 
+            case "ServerReject":
+                HandleServerReject(json);
+                break;
+
             case "WorldSnapshot":
                 HandleWorldSnapshot(json);
                 break;
@@ -681,6 +723,15 @@ public class UdpNetworkClient : MonoBehaviour
     private void HandleServerWelcome(string json)
     {
         ServerWelcomeMessage welcome = JsonUtility.FromJson<ServerWelcomeMessage>(json);
+
+        if (!TrainingCollisionMap2D.IsCompatible(welcome.mapId, welcome.collisionRevision))
+        {
+            RejectConnectionLocally(
+                $"collision-map-mismatch: server={welcome.mapId}@{welcome.collisionRevision}, "
+                + $"client={TrainingCollisionMap2D.MapId}@{TrainingCollisionMap2D.CollisionRevision}");
+            return;
+        }
+
         playerId = welcome.playerId;
         serverTickRate = welcome.serverTickRate > 0 ? welcome.serverTickRate : Mathf.Max(1f, inputTickRate);
         nextFireSequence = 1;
@@ -695,7 +746,39 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         ApplyNetworkControlMode();
-        Debug.Log($"Connected to server. playerId={playerId}, serverTickRate={serverTickRate:F0} Hz, message={welcome.message}");
+        Debug.Log(
+            $"Connected to server. playerId={playerId}, serverTickRate={serverTickRate:F0} Hz, "
+            + $"collisionMap={welcome.mapId}@{welcome.collisionRevision}, message={welcome.message}");
+    }
+
+    private void HandleServerReject(string json)
+    {
+        ServerRejectMessage rejection = JsonUtility.FromJson<ServerRejectMessage>(json);
+        RejectConnectionLocally(
+            $"{rejection.reason}: server expects "
+            + $"{rejection.expectedMapId}@{rejection.expectedCollisionRevision}");
+    }
+
+    private void RejectConnectionLocally(string reason)
+    {
+        connectionRejected = true;
+        connectionRejectionReason = reason ?? "connection-rejected";
+        playerId = 0;
+        ResetLocalPredictionState();
+        NetworkStaticMapBody2D.SetNetworkModeForAll(false);
+
+        if (localTank != null)
+        {
+            localTank.SetLocalControlEnabled(false);
+        }
+
+        if (localAvatar != null)
+        {
+            localAvatar.SetNetworkAuthorityMode(false);
+        }
+
+        CloseSocket();
+        Debug.LogError($"Server connection rejected: {connectionRejectionReason}");
     }
 
     private void HandleWorldSnapshot(string json)
@@ -1478,6 +1561,25 @@ public class UdpNetworkClient : MonoBehaviour
             return;
         }
 
+        // A large authority disagreement must win even while input is held. Deferring
+        // this case previously allowed the owner and remote observers to show different
+        // sides of an obstacle until the owner released movement.
+        if (correctionDistance >= adjustedHardCorrectionDistance)
+        {
+            RecordPredictionCorrection(true);
+            ApplyReconciledLocalStateImmediately(reconciledState);
+
+            if (logLocalPrediction)
+            {
+                Debug.Log(
+                    $"Prediction hard correction: distance={correctionDistance:F3}, " +
+                    $"threshold={adjustedHardCorrectionDistance:F3}, " +
+                    $"pendingInputs={localInputHistory.Count}");
+            }
+
+            return;
+        }
+
         // The predicted Rigidbody is already written by TankMotor in FixedUpdate. Applying
         // a cosmetic correction target while the player is holding movement causes a small
         // but noticeable tug-of-war. Defer it until input becomes idle instead.
@@ -1493,22 +1595,6 @@ public class UdpNetworkClient : MonoBehaviour
                 Debug.Log(
                     $"Prediction correction deferred during active input: " +
                     $"distance={correctionDistance:F3}, pendingInputs={localInputHistory.Count}");
-            }
-
-            return;
-        }
-
-        if (correctionDistance >= adjustedHardCorrectionDistance)
-        {
-            RecordPredictionCorrection(true);
-            ApplyReconciledLocalStateImmediately(reconciledState);
-
-            if (logLocalPrediction)
-            {
-                Debug.Log(
-                    $"Prediction hard correction: distance={correctionDistance:F3}, " +
-                    $"threshold={adjustedHardCorrectionDistance:F3}, " +
-                    $"pendingInputs={localInputHistory.Count}");
             }
 
             return;
@@ -1621,17 +1707,37 @@ public class UdpNetworkClient : MonoBehaviour
         ref float aimX,
         ref float aimZ)
     {
-        float moveAxis = Mathf.Clamp(input.MoveAxis, -1f, 1f);
-        float turnAxis = Mathf.Clamp(input.TurnAxis, -1f, 1f);
-
-        yaw += turnAxis * reconciliationTurnDegreesPerSecond * deltaTime;
-
-        float yawRadians = yaw * Mathf.Deg2Rad;
-        Vector3 forward = new Vector3(Mathf.Sin(yawRadians), 0f, Mathf.Cos(yawRadians));
-        position += forward * reconciliationMoveSpeed * moveAxis * deltaTime;
+        EnsureCollisionWorld();
+        TankPose2D start = new TankPose2D(
+            new Vec2D(position.x, position.z),
+            yaw * Mathf.Deg2Rad);
+        TankMoveResult2D movement = TankCommandSimulation2D.Simulate(
+            collisionWorld,
+            start,
+            input.MoveAxis,
+            input.TurnAxis,
+            reconciliationMoveSpeed,
+            reconciliationTurnDegreesPerSecond,
+            deltaTime);
+        position.x = movement.Pose.Position.X;
+        position.z = movement.Pose.Position.Y;
+        yaw = movement.Pose.GameplayYawRadians * Mathf.Rad2Deg;
 
         aimX = input.AimX;
         aimZ = input.AimZ;
+    }
+
+    private void EnsureCollisionWorld()
+    {
+        if (collisionWorld == null)
+        {
+            collisionWorld = TrainingCollisionMap2D.CreateResolver();
+            mapQueries = new TankMapQueries2D(collisionWorld.Map);
+        }
+        else if (mapQueries == null)
+        {
+            mapQueries = new TankMapQueries2D(collisionWorld.Map);
+        }
     }
 
     private void ReplayCurrentPartialInput(
@@ -1914,6 +2020,9 @@ public class UdpNetworkClient : MonoBehaviour
         GUILayout.Label($"Network Debug ({debugPanelToggleKey})", debugTitleStyle);
         DrawDebugRow("Player ID", playerId > 0 ? playerId.ToString() : "waiting");
         DrawDebugRow("Connection", GetConnectionStateText());
+        DrawDebugRow(
+            "Collision map",
+            $"{TrainingCollisionMap2D.MapId}@{TrainingCollisionMap2D.CollisionRevision}");
         DrawDebugRow("RTT", FormatRttText());
         DrawDebugRow("World ticks", FormatWorldTickText());
         DrawDebugRow("Input ticks", FormatInputTickText());
@@ -1973,6 +2082,11 @@ public class UdpNetworkClient : MonoBehaviour
 
     private string GetConnectionStateText()
     {
+        if (connectionRejected)
+        {
+            return $"Rejected: {connectionRejectionReason}";
+        }
+
         if (udpClient == null)
         {
             return "Socket closed";
@@ -2186,6 +2300,8 @@ public class ClientHelloMessage
 {
     public string type;
     public string name;
+    public string mapId;
+    public int collisionRevision;
 }
 
 [Serializable]
@@ -2200,7 +2316,18 @@ public class ServerWelcomeMessage
     public string type;
     public int playerId;
     public int serverTickRate;
+    public string mapId;
+    public int collisionRevision;
     public string message;
+}
+
+[Serializable]
+public class ServerRejectMessage
+{
+    public string type;
+    public string reason;
+    public string expectedMapId;
+    public int expectedCollisionRevision;
 }
 
 [Serializable]

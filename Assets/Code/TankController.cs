@@ -70,8 +70,7 @@ public class TankController : MonoBehaviour
     {
         if (applyLocalMovement)
         {
-            tankMotor.ApplyMovement(currentInput);
-            tankMotor.ApplyBodyRotation(currentInput);
+            tankMotor.ApplyMovementAndRotation(currentInput);
         }
     }
 

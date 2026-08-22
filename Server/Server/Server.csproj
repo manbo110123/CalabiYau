@@ -7,4 +7,16 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\Assets\Code\CollisionCore\CollisionMath2D.cs" Link="CollisionCore\CollisionMath2D.cs" />
+    <Compile Include="..\..\Assets\Code\CollisionCore\CollisionShapes2D.cs" Link="CollisionCore\CollisionShapes2D.cs" />
+    <Compile Include="..\..\Assets\Code\CollisionCore\CollisionResults2D.cs" Link="CollisionCore\CollisionResults2D.cs" />
+    <Compile Include="..\..\Assets\Code\CollisionCore\CollisionQueries2D.cs" Link="CollisionCore\CollisionQueries2D.cs" />
+    <Compile Include="..\..\Assets\Code\TankCollision2D\TankCollisionMap2D.cs" Link="TankCollision2D\TankCollisionMap2D.cs" />
+    <Compile Include="..\..\Assets\Code\TankCollision2D\TankMapQueries2D.cs" Link="TankCollision2D\TankMapQueries2D.cs" />
+    <Compile Include="..\..\Assets\Code\TankCollision2D\TankWorldCollision2D.cs" Link="TankCollision2D\TankWorldCollision2D.cs" />
+    <Compile Include="..\..\Assets\Code\TankCollision2D\TankCommandSimulation2D.cs" Link="TankCollision2D\TankCommandSimulation2D.cs" />
+    <Compile Include="..\..\Assets\Code\TankCollision2D\TrainingCollisionMap2D.cs" Link="TankCollision2D\TrainingCollisionMap2D.cs" />
+  </ItemGroup>
+
 </Project>
