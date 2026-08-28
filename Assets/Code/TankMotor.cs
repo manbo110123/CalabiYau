@@ -42,15 +42,17 @@ public class TankMotor : MonoBehaviour
 
         if (isEnabled)
         {
+            // Clear motion before switching to kinematic mode. Unity 2022 warns
+            // and ignores velocity assignments made after isKinematic is enabled.
+            StopDynamicBody();
             tankRigidbody.isKinematic = true;
-            tankRigidbody.velocity = Vector3.zero;
-            tankRigidbody.angularVelocity = Vector3.zero;
             return;
         }
 
         if (hasOriginalKinematicState)
         {
             tankRigidbody.isKinematic = originalIsKinematic;
+            StopDynamicBody();
         }
     }
 
@@ -71,6 +73,17 @@ public class TankMotor : MonoBehaviour
         Vector3 movement = transform.forward * moveSpeed * inputData.MoveAxis;
         movement.y = tankRigidbody.velocity.y;
         tankRigidbody.velocity = movement;
+    }
+
+    private void StopDynamicBody()
+    {
+        if (tankRigidbody == null || tankRigidbody.isKinematic)
+        {
+            return;
+        }
+
+        tankRigidbody.velocity = Vector3.zero;
+        tankRigidbody.angularVelocity = Vector3.zero;
     }
 
     public void ApplyMovementAndRotation(TankInputData inputData)

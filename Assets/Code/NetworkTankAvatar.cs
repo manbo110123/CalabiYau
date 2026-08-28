@@ -132,9 +132,19 @@ public class NetworkTankAvatar : MonoBehaviour
             return;
         }
 
-        tankRigidbody.isKinematic = isEnabled;
-        tankRigidbody.velocity = Vector3.zero;
-        tankRigidbody.angularVelocity = Vector3.zero;
+        // Unity ignores velocity writes on a kinematic Rigidbody and reports a
+        // warning in 2022. Clear motion while the body is dynamic, then switch
+        // authority mode. When returning to a dynamic body, clear it afterwards.
+        if (isEnabled)
+        {
+            StopDynamicBody();
+            tankRigidbody.isKinematic = true;
+        }
+        else
+        {
+            tankRigidbody.isKinematic = false;
+            StopDynamicBody();
+        }
     }
 
     public void ApplyServerState(float x, float y, float z, float bodyYaw, float aimX, float aimZ)
@@ -540,8 +550,7 @@ public class NetworkTankAvatar : MonoBehaviour
                 tankRigidbody.rotation = serverRotation;
             }
 
-            tankRigidbody.velocity = Vector3.zero;
-            tankRigidbody.angularVelocity = Vector3.zero;
+            StopDynamicBody();
             return;
         }
 
@@ -555,13 +564,23 @@ public class NetworkTankAvatar : MonoBehaviour
         {
             tankRigidbody.position = serverPosition;
             tankRigidbody.rotation = serverRotation;
-            tankRigidbody.velocity = Vector3.zero;
-            tankRigidbody.angularVelocity = Vector3.zero;
+            StopDynamicBody();
             return;
         }
 
         bodyTransform.position = serverPosition;
         bodyTransform.rotation = serverRotation;
+    }
+
+    private void StopDynamicBody()
+    {
+        if (tankRigidbody == null || tankRigidbody.isKinematic)
+        {
+            return;
+        }
+
+        tankRigidbody.velocity = Vector3.zero;
+        tankRigidbody.angularVelocity = Vector3.zero;
     }
 
     private void ApplyAimState(float aimX, float aimZ)

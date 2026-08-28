@@ -51,6 +51,7 @@ public sealed class NetworkStaticMapBody2D : MonoBehaviour
 
         if (enabled)
         {
+            StopDynamicBody();
             cachedRigidbody.isKinematic = true;
             cachedRigidbody.useGravity = false;
             ResetToAuthoredPose();
@@ -67,6 +68,7 @@ public sealed class NetworkStaticMapBody2D : MonoBehaviour
         ResetToAuthoredPose();
         cachedRigidbody.useGravity = authoredUseGravity;
         cachedRigidbody.isKinematic = authoredIsKinematic;
+        StopDynamicBody();
         isNetworkStatic = false;
     }
 
@@ -93,10 +95,19 @@ public sealed class NetworkStaticMapBody2D : MonoBehaviour
 
     private void ResetToAuthoredPose()
     {
-        cachedRigidbody.velocity = Vector3.zero;
-        cachedRigidbody.angularVelocity = Vector3.zero;
         cachedRigidbody.position = authoredPosition;
         cachedRigidbody.rotation = authoredRotation;
+    }
+
+    private void StopDynamicBody()
+    {
+        if (cachedRigidbody == null || cachedRigidbody.isKinematic)
+        {
+            return;
+        }
+
+        cachedRigidbody.velocity = Vector3.zero;
+        cachedRigidbody.angularVelocity = Vector3.zero;
         cachedRigidbody.Sleep();
     }
 

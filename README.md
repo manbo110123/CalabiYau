@@ -4,6 +4,13 @@
 
 项目定位是实习作品集级联网 Demo：代码优先清晰可讲，不刻意堆复杂框架；先用 `UdpClient + JSON` 跑通核心同步链路，再保留未来升级到 MessagePack、Protocol Buffers、LiteNetLib 或 KCP 的空间。
 
+## Unity 版本
+
+- 当前唯一开发基线：**Unity 2022.3.62f3c1 LTS**。
+- 2026-08-28 已从 Unity 2021.3.45f2c1 完成迁移；后续不要再用 2021 打开主工程，避免资源和项目设置被旧版本反向序列化。
+- 迁移记录、验证结果和回退副本位置见 [Unity 2022 迁移记录](docs/unity-2022-migration.md)。
+- 编辑器中可运行 `Tools > CalabiYau > Validate Unity 2022 Migration`，检查构建场景、预制体脚本和材质 Shader 引用。
+
 ## 快速运行
 
 1. 启动服务器：
@@ -18,6 +25,8 @@ dotnet run
 ```text
 D:\unity project\CalabiYau\CalabiYau
 ```
+
+在 Unity Hub 中确认该项目使用 `2022.3.62f3c1` 后再打开。首次导入或清理 `Library` 后重新打开耗时较长是正常现象。
 
 3. 启动两个客户端：
 
