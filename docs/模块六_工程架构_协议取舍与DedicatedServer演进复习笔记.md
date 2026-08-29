@@ -619,8 +619,8 @@ TankMotor
 TankWeapon
 -> 枪械、弹道、后坐力、动画与特效
 
-二维圆形命中
--> 服务器地图碰撞、角色 Collider / Hitbox
+二维圆形命中 + 已完成的静态墙遮挡
+-> 三维人物 Capsule、角色 HitBox 与动态遮挡历史
 
 同一 Tank Rigidbody
 -> LogicRoot 与 VisualRoot 分离
@@ -660,11 +660,11 @@ Protobuf
 -> 开始长期 3C 学习与表现升级
 ```
 
-等 3C、角色移动和地图碰撞成熟后，再逐步升级：
+等 3C、人物移动和三维地图查询成熟后，再逐步升级：
 
 ```text
 LogicRoot / VisualRoot
-服务器障碍物与角色碰撞
+人物 Capsule、斜坡/台阶与动态物体碰撞
 Collider 历史回溯
 更可信的时钟映射
 Room / Match 架构
@@ -698,5 +698,4 @@ Protobuf 优化单条消息的体积与序列化成本，但不能替代兴趣�
 
 ## 十七、60 秒模块总结
 
-> 服务端以 `GameWorld` 为无渲染权威逻辑核心，`UdpGameServer` 负责 UDP 收发与 Tick 调度，`ClientRegistry` 管理 Endpoint 会话和每客户端网络状态，`SnapshotBuilder` 与 `ClientReplicator` 分别负责读取世界和按客户端复制，可靠事件账本独立处理 ACK 与重发。当前使用 UDP + JSON：UDP 服务实时状态的新鲜度，JSON 服务学习阶段的可读和调试；二进制协议是后续性能优化而非同步正确性的替代。运行形态上，项目已是单进程、单对局的 Dedicated Server 雏形，未来可先房间化多个 `GameWorld`，再扩展大厅匹配与战斗服调度。当前最合理的后续是完成复习与面试演练，再把网络底座迁移到长期的 3C、地图碰撞和逻辑表现分离中。
-
+> 服务端以 `GameWorld` 为无渲染权威逻辑核心，`UdpGameServer` 负责 UDP 收发与 Tick 调度，`ClientRegistry` 管理 Endpoint 会话和每客户端网络状态，`SnapshotBuilder` 与 `ClientReplicator` 分别负责读取世界和按客户端复制，可靠事件账本独立处理 ACK 与重发。当前使用 UDP + JSON：UDP 服务实时状态的新鲜度，JSON 服务学习阶段的可读和调试；二进制协议是后续性能优化而非同步正确性的替代。运行形态上，项目已是单进程、单对局的 Dedicated Server 雏形，未来可先房间化多个 `GameWorld`，再扩展大厅匹配与战斗服调度。Tank 二维静态碰撞与查询已经完成，当前最合理的后续是把网络底座迁移到人物 3C、三维角色碰撞和逻辑/表现分离中。

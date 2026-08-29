@@ -49,6 +49,8 @@ D:\unity project\CalabiYau\CalabiYau
 - 网络开火事件、命中事件和血量变化事件。
 - 服务端权威扣血、死亡、重生。
 - 服务器侧射击延迟补偿，基于历史状态回溯目标位置。
+- 版本化二维静态地图碰撞：服务器、客户端预测和未确认输入重放共享 Tank 移动规则。
+- 静态墙体优先的权威射击遮挡，以及合法出生/重生位置查询。
 - Unity 运行时网络调试面板，按 `F3` 显示或隐藏。
 - 弱网测试可配合 clumsy 进行延迟、抖动、丢包验证。
 
@@ -80,11 +82,23 @@ D:\unity project\CalabiYau\CalabiYau
 - 坦克移动：[TankMotor.cs](Assets/Code/TankMotor.cs)
 - 瞄准与炮塔：[TankAim.cs](Assets/Code/TankAim.cs)
 - 武器表现：[TankWeapon.cs](Assets/Code/TankWeapon.cs)
+- 共享碰撞数学：[CollisionCore](Assets/Code/CollisionCore)
+- Tank 权威地图与移动查询：[TankCollision2D](Assets/Code/TankCollision2D)
 - .NET UDP 服务器：[Program.cs](Server/Server/Program.cs)
 
 ## 复习文档
 
 面试复习和技术讲解请看：
 
-[docs/networked-tps-review-guide.md](docs/networked-tps-review-guide.md)
+[项目复习指南](docs/项目复习指南.md)
+
+## 人物 3C 开发入口
+
+Tank 网络基线之后的人物主线采用“一课一次对话”的陪练方式推进。请从下列文档开始，不要直接跳到人物控制器或技能阶段：
+
+1. [3C 开发陪练手册：总目录与协作方式](docs/3C开发陪练手册/00_总目录与协作方式.md)
+2. [第一分卷：起步准备、资源、Package 与 CharacterLab](docs/3C开发陪练手册/01_起步准备_资源_Package与实验场.md)
+3. [二次元第三人称动作射击开发计划书](docs/CalabiYau二次元第三人称动作射击开发计划书.md)（架构总纲与技术路线，不作为逐步操作教程）
+
+当前入口是 **S00：保存已验收的 Tank 基线**。之后每课由开发者完成 Unity 可视化操作与人工验收，Codex 负责检查工程、实现代码、解释原理、给出精确组件绑定并维护阶段记录。
 
