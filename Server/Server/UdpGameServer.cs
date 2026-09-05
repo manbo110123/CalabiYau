@@ -304,7 +304,7 @@ public sealed class UdpGameServer : IDisposable
             {
                 spawnAccepted = world.AddPlayer(
                     registration.Client.PlayerId,
-                    out spawnRejectionReason);
+                    out spawnRejectionReason, hello!.CharacterMovement);
 
                 if (spawnAccepted)
                 {
@@ -389,7 +389,7 @@ public sealed class UdpGameServer : IDisposable
                 input.MoveAxis,
                 input.TurnAxis,
                 input.AimX,
-                input.AimZ);
+                input.AimZ, input.BodyYaw, input.ShoulderHeld, input.IsWalking);
 
             CommandGateResult result = world.TryQueueInput(client.PlayerId, command);
 

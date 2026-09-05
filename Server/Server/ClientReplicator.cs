@@ -207,6 +207,8 @@ public sealed class ClientReplicator
         return new PlayerSnapshotMessage
         {
             PlayerId = state.PlayerId,
+            CharacterMovement = state.CharacterMovement,
+            ShoulderHeld = state.ShoulderHeld,
             X = state.X,
             Y = state.Y,
             Z = state.Z,

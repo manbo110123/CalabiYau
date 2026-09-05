@@ -47,6 +47,9 @@ public sealed class GameWorldSettings
 public sealed class GameWorld
 {
     private readonly GameWorldSettings settings;
+    // First integration pass uses a conservative upright footprint on the existing flat map.
+    private readonly TankWorldCollision2D characterCollisionWorld = new TankWorldCollision2D(
+        TrainingCollisionMap2D.CreateMap(), new TankCollisionSettings2D(new Vec2D(0.35f, 0.35f)));
     private readonly TankWorldCollision2D collisionWorld;
     private readonly TankMapQueries2D mapQueries;
     private readonly Dictionary<int, PlayerState> playersById = new Dictionary<int, PlayerState>();
@@ -97,7 +100,7 @@ public sealed class GameWorld
         return AddPlayer(playerId, out _);
     }
 
-    public bool AddPlayer(int playerId, out string rejectionReason)
+    public bool AddPlayer(int playerId, out string rejectionReason, bool characterMovement = false)
     {
         if (playersById.ContainsKey(playerId))
         {
@@ -112,6 +115,7 @@ public sealed class GameWorld
         }
 
         playersById.Add(playerId, CreateInitialPlayerState(playerId, spawn));
+        playersById[playerId].CharacterMovement = characterMovement;
         rejectionReason = string.Empty;
         return true;
     }
@@ -144,7 +148,7 @@ public sealed class GameWorld
             return RejectInput("invalid-input-tick");
         }
 
-        if (!IsFinite(input.MoveAxis)
+        if (!IsFinite(input.BodyYaw) || !IsFinite(input.MoveAxis)
             || !IsFinite(input.TurnAxis)
             || !IsFinite(input.AimX)
             || !IsFinite(input.AimZ))
@@ -591,6 +595,25 @@ public sealed class GameWorld
         IncrementRejectionCount(spawnRejectionsByReason, reason);
     }
 
+    private void SimulateCharacter(PlayerState player, InputCommand input, float deltaTime)
+    {
+        float magnitude = MathF.Sqrt(input.MoveAxis * input.MoveAxis + input.TurnAxis * input.TurnAxis);
+        float scale = 1f / MathF.Max(1f, magnitude);
+        float speed = (input.IsWalking ? 2f : 3.5f) * (input.ShoulderHeld ? 0.55f : 1f);
+        Vec2D start = new Vec2D(player.X, player.Z);
+        // Axis-aligned square retains an identical footprint for both sweeps.
+        TankMoveResult2D x = characterCollisionWorld.Move(
+            new TankPose2D(start, MathF.PI / 2f), input.MoveAxis * scale * speed * deltaTime, 0f);
+        TankMoveResult2D z = characterCollisionWorld.Move(
+            new TankPose2D(x.Pose.Position, 0f), input.TurnAxis * scale * speed * deltaTime, 0f);
+        player.X = z.Pose.Position.X;
+        player.Z = z.Pose.Position.Y;
+        player.BodyYaw = input.BodyYaw % 360f;
+        player.ShoulderHeld = input.ShoulderHeld;
+        player.AimX = input.AimX;
+        player.AimZ = input.AimZ;
+    }
+
     private void SimulatePlayer(PlayerState player, float deltaTime)
     {
         if (!player.IsAlive)
@@ -599,6 +622,11 @@ public sealed class GameWorld
         }
 
         InputCommand input = player.LatestInput;
+        if (player.CharacterMovement)
+        {
+            SimulateCharacter(player, input, deltaTime);
+            return;
+        }
         TankPose2D start = new TankPose2D(
             new Vec2D(player.X, player.Z),
             DegreesToRadians(player.BodyYaw));
@@ -717,7 +745,7 @@ public sealed class GameWorld
                     0f,
                     0f,
                     player.LatestInput.AimX,
-                    player.LatestInput.AimZ);
+                    player.LatestInput.AimZ, player.BodyYaw);
             }
 
             return;
@@ -1017,13 +1045,17 @@ public sealed class GameWorld
 
 public readonly struct InputCommand
 {
-    public InputCommand(int inputTick, float moveAxis, float turnAxis, float aimX, float aimZ)
+    public InputCommand(int inputTick, float moveAxis, float turnAxis, float aimX, float aimZ,
+        float bodyYaw = 0f, bool shoulderHeld = false, bool isWalking = false)
     {
         InputTick = inputTick;
         MoveAxis = moveAxis;
         TurnAxis = turnAxis;
         AimX = aimX;
         AimZ = aimZ;
+        BodyYaw = bodyYaw;
+        ShoulderHeld = shoulderHeld;
+        IsWalking = isWalking;
     }
 
     public int InputTick { get; }
@@ -1077,6 +1109,9 @@ public readonly struct FireCommand
     public int RequestTick { get; }
     public float AimX { get; }
     public float AimZ { get; }
+    public float BodyYaw { get; }
+    public bool ShoulderHeld { get; }
+    public bool IsWalking { get; }
     public float EstimatedRttSeconds { get; }
     public float InterpolationDelaySeconds { get; }
 }
@@ -1111,6 +1146,8 @@ public readonly struct FireReceiptDecision
 
 public sealed class PlayerState
 {
+    public bool CharacterMovement { get; internal set; }
+    public bool ShoulderHeld { get; internal set; }
     public int PlayerId { get; internal set; }
     public float X { get; internal set; }
     public float Y { get; internal set; }

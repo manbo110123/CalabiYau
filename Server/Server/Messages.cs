@@ -2,6 +2,8 @@ using System.Text.Json.Serialization;
 
 public sealed class ClientHelloMessage
 {
+    [JsonPropertyName("characterMovement")]
+    public bool CharacterMovement { get; set; }
     [JsonPropertyName("type")]
     public string Type { get; set; } = string.Empty;
 
@@ -55,6 +57,12 @@ public sealed class ServerRejectMessage
 
 public sealed class PlayerInputMessage
 {
+    [JsonPropertyName("bodyYaw")]
+    public float BodyYaw { get; set; }
+    [JsonPropertyName("shoulderHeld")]
+    public bool ShoulderHeld { get; set; }
+    [JsonPropertyName("isWalking")]
+    public bool IsWalking { get; set; }
     [JsonPropertyName("type")]
     public string Type { get; set; } = string.Empty;
 
@@ -163,6 +171,10 @@ public sealed class ClientGoodbyeMessage
 
 public sealed class PlayerSnapshotMessage
 {
+    [JsonPropertyName("characterMovement")]
+    public bool CharacterMovement { get; set; }
+    [JsonPropertyName("shoulderHeld")]
+    public bool ShoulderHeld { get; set; }
     [JsonPropertyName("playerId")]
     public int PlayerId { get; set; }
 

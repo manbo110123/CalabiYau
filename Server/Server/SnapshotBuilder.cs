@@ -36,6 +36,8 @@ public sealed class SnapshotBuilder
         return new PlayerSnapshotMessage
         {
             PlayerId = player.PlayerId,
+            CharacterMovement = player.CharacterMovement,
+            ShoulderHeld = player.ShoulderHeld,
             X = player.X,
             Y = player.Y,
             Z = player.Z,
