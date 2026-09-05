@@ -49,7 +49,7 @@ public sealed class GameWorld
     private readonly GameWorldSettings settings;
     // First integration pass uses a conservative upright footprint on the existing flat map.
     private readonly TankWorldCollision2D characterCollisionWorld = new TankWorldCollision2D(
-        TrainingCollisionMap2D.CreateMap(), new TankCollisionSettings2D(new Vec2D(0.35f, 0.35f)));
+        TrainingCollisionMap2D.CreateMap(), new TankCollisionSettings2D(new Vec2D(0.35f, 0.35f), 0.01f, 0.1f, 64, 4));
     private readonly TankWorldCollision2D collisionWorld;
     private readonly TankMapQueries2D mapQueries;
     private readonly Dictionary<int, PlayerState> playersById = new Dictionary<int, PlayerState>();
@@ -1059,6 +1059,9 @@ public readonly struct InputCommand
     }
 
     public int InputTick { get; }
+    public float BodyYaw { get; }
+    public bool ShoulderHeld { get; }
+    public bool IsWalking { get; }
     public float MoveAxis { get; }
     public float TurnAxis { get; }
     public float AimX { get; }
@@ -1109,9 +1112,6 @@ public readonly struct FireCommand
     public int RequestTick { get; }
     public float AimX { get; }
     public float AimZ { get; }
-    public float BodyYaw { get; }
-    public bool ShoulderHeld { get; }
-    public bool IsWalking { get; }
     public float EstimatedRttSeconds { get; }
     public float InterpolationDelaySeconds { get; }
 }
